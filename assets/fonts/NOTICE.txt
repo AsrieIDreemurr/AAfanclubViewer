@@ -1,0 +1,10 @@
+Saitamaar
+=========
+
+Saitamaar is an ASCII-art font originally developed by YAMASINA Keage.
+The font is bundled unchanged from the copy served by aafanclub.com so the
+application can reproduce the site's text metrics on Windows and Android.
+
+The maintained SaitamaarFont project describes the font as public domain and
+also distributes its maintained source under the SIL Open Font License 1.1:
+https://github.com/asciiart-development/SaitamaarFont
