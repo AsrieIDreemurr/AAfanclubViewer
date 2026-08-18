@@ -99,22 +99,74 @@ class FloorBookmark extends ReadingMarker {
   }
 }
 
+/// Size and placement of one invisible edge zone. A null field means "use the
+/// value derived from the screen", which is how [isDefault] stays meaningful
+/// across different window sizes.
+class EdgeZoneLayout {
+  const EdgeZoneLayout({this.width, this.height, this.centerFactor});
+
+  final double? width;
+  final double? height;
+
+  /// Vertical centre as a fraction of the reading area's height.
+  final double? centerFactor;
+
+  bool get isDefault =>
+      width == null && height == null && centerFactor == null;
+
+  EdgeZoneLayout copyWith({
+    double? width,
+    double? height,
+    double? centerFactor,
+  }) => EdgeZoneLayout(
+    width: width ?? this.width,
+    height: height ?? this.height,
+    centerFactor: centerFactor ?? this.centerFactor,
+  );
+
+  Map<String, Object> toJson() => {
+    if (width != null) 'width': width!,
+    if (height != null) 'height': height!,
+    if (centerFactor != null) 'centerFactor': centerFactor!,
+  };
+
+  static EdgeZoneLayout fromJson(Object? value) {
+    if (value is! Map) return const EdgeZoneLayout();
+    double? read(String key) {
+      final raw = value[key];
+      return raw is num ? raw.toDouble() : null;
+    }
+
+    return EdgeZoneLayout(
+      width: read('width'),
+      height: read('height'),
+      centerFactor: read('centerFactor'),
+    );
+  }
+}
+
 class ReaderStore extends ChangeNotifier {
   static const _progressKey = 'reader.progress.v1';
   static const _bookmarkKey = 'reader.bookmarks.v1';
   static const _scaleKey = 'reader.displayScale.v1';
   static const _loginKey = 'reader.login.v1';
+  static const _edgeZonesKey = 'reader.edgeZones.v1';
 
   SharedPreferences? _preferences;
   final Map<String, ReadingMarker> _progress = {};
   final List<FloorBookmark> _bookmarks = [];
   double _displayScale = 1;
   CachedLogin? _login;
+  EdgeZoneLayout _leftEdgeZone = const EdgeZoneLayout();
+  EdgeZoneLayout _rightEdgeZone = const EdgeZoneLayout();
   bool _loaded = false;
 
   bool get loaded => _loaded;
   double get displayScale => _displayScale;
   CachedLogin? get login => _login;
+  EdgeZoneLayout get leftEdgeZone => _leftEdgeZone;
+  EdgeZoneLayout get rightEdgeZone => _rightEdgeZone;
+  EdgeZoneLayout edgeZone(bool left) => left ? _leftEdgeZone : _rightEdgeZone;
   List<FloorBookmark> get bookmarks => List.unmodifiable(_bookmarks);
   List<ReadingMarker> get openedThreads {
     final result =
@@ -132,6 +184,15 @@ class ReaderStore extends ChangeNotifier {
 
       final rawLogin = preferences.getString(_loginKey);
       if (rawLogin != null) _login = CachedLogin.fromJson(jsonDecode(rawLogin));
+
+      final rawZones = preferences.getString(_edgeZonesKey);
+      if (rawZones != null) {
+        final decoded = jsonDecode(rawZones);
+        if (decoded is Map) {
+          _leftEdgeZone = EdgeZoneLayout.fromJson(decoded['left']);
+          _rightEdgeZone = EdgeZoneLayout.fromJson(decoded['right']);
+        }
+      }
 
       final rawProgress = preferences.getString(_progressKey);
       if (rawProgress != null) {
@@ -176,6 +237,35 @@ class ReaderStore extends ChangeNotifier {
     unawaited(_preferences?.setDouble(_scaleKey, next));
   }
 
+  void setEdgeZone(bool left, EdgeZoneLayout layout) {
+    if (left) {
+      _leftEdgeZone = layout;
+    } else {
+      _rightEdgeZone = layout;
+    }
+    notifyListeners();
+    _saveEdgeZones();
+  }
+
+  void resetEdgeZone(bool left) {
+    if (edgeZone(left).isDefault) return;
+    setEdgeZone(left, const EdgeZoneLayout());
+  }
+
+  void _saveEdgeZones() {
+    final preferences = _preferences;
+    if (preferences == null) return;
+    unawaited(
+      preferences.setString(
+        _edgeZonesKey,
+        jsonEncode({
+          'left': _leftEdgeZone.toJson(),
+          'right': _rightEdgeZone.toJson(),
+        }),
+      ),
+    );
+  }
+
   void saveLogin(String name, String trip) {
     final normalizedName = name.trim();
     if (normalizedName.isEmpty || trip.isEmpty) return;
@@ -202,11 +292,13 @@ class ReaderStore extends ChangeNotifier {
     _saveProgress();
   }
 
+  /// Tracks where the reader actually is, in both directions, so a thread tab
+  /// always mirrors the floor on screen instead of the furthest one reached.
   void recordProgress(ForumDocument document, int floor) {
     final threadId = document.threadId;
     if (threadId == null || floor < 1) return;
     final previous = _progress[threadId];
-    if (previous != null && previous.floor >= floor) return;
+    if (previous != null && previous.floor == floor) return;
     _progress[threadId] = ReadingMarker(
       threadId: threadId,
       threadTitle: document.title,
@@ -214,6 +306,13 @@ class ReaderStore extends ChangeNotifier {
       floor: floor,
       updatedAt: DateTime.now(),
     );
+    notifyListeners();
+    _saveProgress();
+  }
+
+  /// Drops a thread tab. Floor bookmarks for the thread are kept.
+  void removeThread(String threadId) {
+    if (_progress.remove(threadId) == null) return;
     notifyListeners();
     _saveProgress();
   }

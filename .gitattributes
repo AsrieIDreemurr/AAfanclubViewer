@@ -1,2 +1,27 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Store every text file with LF in the repository and check it out with LF on
+# every platform. Without the explicit eol, Windows checks files out as CRLF
+# while the tools here write LF, which leaves the working tree permanently
+# "about to change" and mixes both endings inside single files.
+* text=auto eol=lf
+
+# Windows shells want CRLF in their own scripts.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Never let the filters touch binary assets.
+*.ttf binary
+*.otf binary
+*.woff binary
+*.woff2 binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.jar binary
+*.apk binary
+*.aab binary
+*.so binary
+*.dll binary
+*.exe binary
+*.keystore binary
+*.jks binary

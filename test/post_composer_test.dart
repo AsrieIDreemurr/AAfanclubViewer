@@ -1,4 +1,3 @@
-import 'package:aafanclub_viewer/ui/aa_text.dart';
 import 'package:aafanclub_viewer/ui/post_composer_sheet.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -27,6 +26,100 @@ void main() {
         ComposerTextLayer(text: '\u00a0Q', row: 0, column: 0),
       ]),
       'AQC',
+    );
+  });
+
+  test('padding follows measured width so windows stay in column', () {
+    // A proportional face where 'W' is twice a space and 'i' is half of one —
+    // the shape that used to shear the right-hand window row by row.
+    const spaceWidth = 10.0;
+    double measure(String text) {
+      var total = 0.0;
+      for (final rune in text.runes) {
+        total += switch (String.fromCharCode(rune)) {
+          'W' => 20.0,
+          'i' => 5.0,
+          _ => 10.0,
+        };
+      }
+      return total;
+    }
+
+    final output = composeTextLayers(
+      const [
+        // Left window: two lines whose glyphs measure differently.
+        ComposerTextLayer(text: 'WW\nii', row: 0, column: 0),
+        // Right window: must start at the same pixel column on both rows.
+        ComposerTextLayer(text: 'X\nX', row: 0, column: 6),
+      ],
+      measureWidth: measure,
+      spaceWidth: spaceWidth,
+    );
+
+    final lines = output.split('\n');
+    expect(lines, hasLength(2));
+    for (final line in lines) {
+      final target = line.indexOf('X');
+      expect(measure(line.substring(0, target)), closeTo(6 * spaceWidth, 5));
+    }
+    // 'WW' already measures 4 cells wide, 'ii' only one, so the two rows need
+    // a different number of spaces to reach the same place.
+    expect(lines[0], isNot(equals(lines[1].replaceAll('i', 'W'))));
+  });
+
+  test('a long run of ideographic spaces keeps a single drawing aligned', () {
+    // Real Saitamaar metrics at 16px: the ideographic space is 2.2 space
+    // widths, not 2, so a cell-counting engine drifts 10% per character.
+    const space = 5.0;
+    double measure(String text) {
+      var total = 0.0;
+      for (final rune in text.runes) {
+        total += switch (rune) {
+          0x3000 => 11.0,
+          0x0020 => 5.0,
+          _ => 15.0,
+        };
+      }
+      return total;
+    }
+
+    final output = composeTextLayers(
+      const [ComposerTextLayer(text: '　　　　　　　　　　あ', row: 0, column: 0)],
+      measureWidth: measure,
+      spaceWidth: space,
+    );
+
+    final glyph = output.indexOf('あ');
+    expect(glyph, greaterThan(0));
+    expect(
+      measure(output.substring(0, glyph)),
+      closeTo(10 * 11.0, space / 2),
+    );
+  });
+
+  test('glyphs before the origin are dropped, not shifted', () {
+    expect(
+      composeTextLayers(const [
+        ComposerTextLayer(text: 'ABCD', row: 0, column: -2),
+      ]),
+      'CD',
+    );
+
+    // A window pulled above the origin keeps the rows that remain in frame.
+    expect(
+      composeTextLayers(const [
+        ComposerTextLayer(text: 'one\ntwo\nsix', row: -2, column: 0),
+      ]),
+      'six',
+    );
+
+    // Clipping one window must not move a window that is still inside.
+    expect(
+      composeTextLayers(const [
+        ComposerTextLayer(text: 'XY', row: 0, column: -1),
+        ComposerTextLayer(text: 'Z', row: 0, column: 4),
+      ]),
+      'Y   Z',
     );
   });
 
@@ -71,13 +164,31 @@ void main() {
     await tester.tap(find.byKey(const Key('composer-primary-action')));
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('composer-preview')), findsOneWidget);
+    final previewField = find.byKey(const Key('composer-preview-text'));
     expect(
-      tester
-          .widget<AaText>(find.byKey(const Key('composer-preview-text')))
-          .data,
+      tester.widget<TextField>(previewField).controller?.text,
       contains('ABC'),
     );
     expect(find.text('发送'), findsOneWidget);
+
+    // The confirmed text is editable, and 取消 throws those edits away
+    // instead of turning them into another window.
+    await tester.enterText(previewField, 'ABC 直接输入');
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('composer-cancel-preview')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('composer-preview')), findsNothing);
+    expect(find.text('ABC 直接输入'), findsNothing);
+
+    await tester.tap(find.byKey(const Key('composer-primary-action')));
+    await tester.pumpAndSettle();
+    expect(
+      tester
+          .widget<TextField>(find.byKey(const Key('composer-preview-text')))
+          .controller
+          ?.text,
+      contains('ABC'),
+    );
     expect(submitCalls, 0);
 
     await tester.tap(find.byKey(const Key('composer-cancel-preview')));

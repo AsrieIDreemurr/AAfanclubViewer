@@ -19,7 +19,7 @@ class ForumDocument {
     this.currentPage,
     this.pageCount,
     this.threadId,
-    this.ownerOnlyUri,
+    this.ownerFilter,
   });
 
   final Uri uri;
@@ -35,7 +35,7 @@ class ForumDocument {
   final int? currentPage;
   final int? pageCount;
   final String? threadId;
-  final Uri? ownerOnlyUri;
+  final ForumLink? ownerFilter;
 
   ForumDocument copyWith({
     Uri? uri,
@@ -51,7 +51,7 @@ class ForumDocument {
     int? currentPage,
     int? pageCount,
     String? threadId,
-    Uri? ownerOnlyUri,
+    ForumLink? ownerFilter,
   }) => ForumDocument(
     uri: uri ?? this.uri,
     title: title ?? this.title,
@@ -66,7 +66,7 @@ class ForumDocument {
     currentPage: currentPage ?? this.currentPage,
     pageCount: pageCount ?? this.pageCount,
     threadId: threadId ?? this.threadId,
-    ownerOnlyUri: ownerOnlyUri ?? this.ownerOnlyUri,
+    ownerFilter: ownerFilter ?? this.ownerFilter,
   );
 }
 

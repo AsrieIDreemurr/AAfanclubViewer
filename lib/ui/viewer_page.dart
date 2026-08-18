@@ -1,6 +1,9 @@
 import 'dart:async';
 
+import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 
 import '../application/reader_store.dart';
@@ -24,7 +27,9 @@ class ViewerPage extends StatefulWidget {
 
 class _ViewerPageState extends State<ViewerPage> {
   static const _home = 'http://aafanclub.com/';
+  static const _postsPerPage = 50;
   static final _threadPath = RegExp(r'^/view/(\d+)(?:-\d+)?(?:-icchi)?/?$');
+  static final _boardPath = RegExp(r'^/form-(\d+)-(\d+)/?$');
 
   late final ViewerController _controller;
   late final ReaderStore _readerStore;
@@ -37,6 +42,18 @@ class _ViewerPageState extends State<ViewerPage> {
   int? _jumpFloor;
   int _jumpNonce = 0;
   bool _drawerOpen = false;
+  bool _edgeHintVisible = false;
+  DateTime? _lastBackPress;
+  Timer? _middleTapTimer;
+
+  /// Windows and other desktop targets get a visible toolbar plus keyboard
+  /// shortcuts; touch targets keep the original chrome-free reading surface.
+  bool get _isDesktop => switch (defaultTargetPlatform) {
+    TargetPlatform.windows ||
+    TargetPlatform.linux ||
+    TargetPlatform.macOS => true,
+    _ => false,
+  };
 
   @override
   void initState() {
@@ -67,6 +84,7 @@ class _ViewerPageState extends State<ViewerPage> {
       ..removeListener(_onStoreChange)
       ..dispose();
     _progressTimer?.cancel();
+    _middleTapTimer?.cancel();
     super.dispose();
   }
 
@@ -112,19 +130,74 @@ class _ViewerPageState extends State<ViewerPage> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: SafeArea(
-        child: LayoutBuilder(
-          builder: (context, constraints) {
+    return PopScope(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (!didPop) unawaited(_handleSystemBack());
+      },
+      child: Scaffold(body: SafeArea(child: _buildShortcutScope(_buildShell()))),
+    );
+  }
+
+  /// Desktop key bindings mirror the toolbar. Text fields keep their own keys,
+  /// so every binding except Escape stands down while the caret is active.
+  Widget _buildShortcutScope(Widget child) {
+    if (!_isDesktop) return child;
+    return CallbackShortcuts(
+      bindings: {
+        const SingleActivator(LogicalKeyboardKey.f5): () => _onShortcut(_reload),
+        const SingleActivator(LogicalKeyboardKey.keyR, control: true):
+            () => _onShortcut(_reload),
+        const SingleActivator(LogicalKeyboardKey.arrowLeft, alt: true):
+            () => _onShortcut(_goBack),
+        const SingleActivator(LogicalKeyboardKey.arrowRight, alt: true):
+            () => _onShortcut(_goForward),
+        const SingleActivator(LogicalKeyboardKey.home, alt: true):
+            () => _onShortcut(_goHome),
+        const SingleActivator(LogicalKeyboardKey.pageUp, control: true):
+            () => _onShortcut(() => _goToRelativePage(-1)),
+        const SingleActivator(LogicalKeyboardKey.pageDown, control: true):
+            () => _onShortcut(() => _goToRelativePage(1)),
+        const SingleActivator(LogicalKeyboardKey.keyG, control: true):
+            () => _onShortcut(_promptJumpToFloor),
+        const SingleActivator(LogicalKeyboardKey.keyD, control: true):
+            () => _onShortcut(_bookmarkCurrentFloor),
+        const SingleActivator(LogicalKeyboardKey.escape): _closePanel,
+      },
+      child: Focus(autofocus: true, child: child),
+    );
+  }
+
+  Widget _buildShell() {
+    return Column(
+      children: [
+        if (_isDesktop)
+          _DesktopToolbar(
+            canGoBack: _controller.canGoBack,
+            canGoForward: _controller.canGoForward,
+            canReload: _controller.canReload,
+            currentPage: _currentPage,
+            pageCount: _pageCount,
+            isThread: _controller.document?.kind == ForumPageKind.thread,
+            onBack: _goBack,
+            onForward: _goForward,
+            onReload: _reload,
+            onHome: _goHome,
+            onBoardList: _goBoardList,
+            onPreviousPage: () => _goToRelativePage(-1),
+            onNextPage: () => _goToRelativePage(1),
+            onJumpToFloor: _promptJumpToFloor,
+            onOpenPanel: () => setState(() => _drawerOpen = !_drawerOpen),
+          ),
+        Expanded(
+          child: LayoutBuilder(
+            builder: (context, constraints) {
             final panelWidth = (constraints.maxWidth * 0.68).clamp(
               250.0,
               390.0,
             );
-            final edgeWidth = (constraints.maxWidth * 0.18).clamp(56.0, 96.0);
-            final edgeHeight = (constraints.maxHeight * 0.26).clamp(
-              150.0,
-              220.0,
-            );
+            final leftZone = _resolveZone(true, constraints.biggest);
+            final rightZone = _resolveZone(false, constraints.biggest);
             return Stack(
               children: [
                 Positioned.fill(
@@ -134,12 +207,24 @@ class _ViewerPageState extends State<ViewerPage> {
                     ),
                     child: _EdgeTapSurface(
                       size: constraints.biggest,
-                      edgeWidth: edgeWidth,
-                      edgeHeight: edgeHeight,
-                      enabled: !_drawerOpen,
+                      leftZone: leftZone,
+                      rightZone: rightZone,
+                      // The desktop toolbar replaces the invisible zones so a
+                      // stray click never reloads the page.
+                      enabled: !_drawerOpen && !_isDesktop,
                       canRefresh: _controller.canReload,
                       onRefresh: _controller.reload,
                       onOpenPanel: () => setState(() => _drawerOpen = true),
+                      hintVisible: _edgeHintVisible,
+                      onMiddleTap: _handleMiddleTap,
+                      onHideHint: _hideEdgeHint,
+                      onZoneMoved:
+                          (left, dy) =>
+                              _moveZone(left, dy, constraints.biggest),
+                      onZoneResized:
+                          (left, dx, dy) =>
+                              _resizeZone(left, dx, dy, constraints.biggest),
+                      onZoneReset: _readerStore.resetEdgeZone,
                       child: _BottomPullToRefresh(
                         enabled: !_drawerOpen && _controller.canReload,
                         onRefresh: _controller.reload,
@@ -202,14 +287,13 @@ class _ViewerPageState extends State<ViewerPage> {
                     bookmarks: _readerStore.bookmarks,
                     displayScale: _readerStore.displayScale,
                     busy: _controller.isSubmitting,
-                    canGoBack: _controller.canGoBack,
                     onClose: () => setState(() => _drawerOpen = false),
                     onHome: _goHome,
-                    onBack: _goBack,
                     onBookmarkCurrent: _bookmarkCurrentFloor,
                     onOpenThread: _openSavedPosition,
                     onOpenBookmark: _openBookmark,
                     onRemoveBookmark: _readerStore.removeBookmark,
+                    onRemoveThread: _readerStore.removeThread,
                     onScaleChanged: _readerStore.setDisplayScale,
                     onClearCache: _controller.clearCache,
                     login: _readerStore.login,
@@ -217,13 +301,19 @@ class _ViewerPageState extends State<ViewerPage> {
                     onStartReply: () => _openComposer(ComposerMode.reply),
                     onStartNewThread:
                         () => _openComposer(ComposerMode.newThread),
+                    currentPage: _currentPage,
+                    pageCount: _pageCount,
+                    onPreviousPage: () => _goToRelativePage(-1),
+                    onNextPage: () => _goToRelativePage(1),
+                    onJumpToFloor: _promptJumpToFloor,
                   ),
                 ),
               ],
             );
-          },
+            },
+          ),
         ),
-      ),
+      ],
     );
   }
 
@@ -254,6 +344,7 @@ class _ViewerPageState extends State<ViewerPage> {
   }
 
   void _navigate(Uri uri) {
+    _hideEdgeHint();
     final match = _threadPath.firstMatch(uri.path);
     final targetThread = match?.group(1);
     final currentThread = _controller.document?.threadId;
@@ -284,7 +375,7 @@ class _ViewerPageState extends State<ViewerPage> {
       return;
     }
 
-    final targetPage = ((floor - 1) ~/ 50) + 1;
+    final targetPage = ((floor - 1) ~/ _postsPerPage) + 1;
     if (targetThread == document.threadId &&
         targetPage == (document.currentPage ?? 1)) {
       setState(() {
@@ -326,7 +417,7 @@ class _ViewerPageState extends State<ViewerPage> {
 
   void _openSavedPosition(ReadingMarker marker) {
     final document = _controller.document;
-    final targetPage = ((marker.floor - 1) ~/ 50) + 1;
+    final targetPage = ((marker.floor - 1) ~/ _postsPerPage) + 1;
     if (document?.threadId == marker.threadId &&
         (document?.currentPage ?? 1) == targetPage) {
       setState(() {
@@ -351,6 +442,215 @@ class _ViewerPageState extends State<ViewerPage> {
   void _goBack() {
     setState(() => _drawerOpen = false);
     unawaited(_controller.goBack());
+  }
+
+  void _goForward() {
+    setState(() => _drawerOpen = false);
+    unawaited(_controller.goForward());
+  }
+
+  void _goBoardList() {
+    setState(() => _drawerOpen = false);
+    unawaited(_controller.openLink(Uri.parse(_home).resolve('/form-1-1/')));
+  }
+
+  void _reload() => unawaited(_controller.reload());
+
+  void _closePanel() {
+    if (_drawerOpen) setState(() => _drawerOpen = false);
+  }
+
+  /// Two taps on the reading area reveal the invisible edge zones. Anything
+  /// else — a further tap, a scroll, a navigation — puts them away again.
+  void _handleMiddleTap() {
+    if (_edgeHintVisible) {
+      _hideEdgeHint();
+      return;
+    }
+    if (_middleTapTimer?.isActive ?? false) {
+      _middleTapTimer?.cancel();
+      _middleTapTimer = null;
+      // The second tap also lands on the text's SelectionArea, which selects a
+      // word. Dropping focus clears that so the zones are what you get.
+      FocusManager.instance.primaryFocus?.unfocus();
+      setState(() => _edgeHintVisible = true);
+      return;
+    }
+    _middleTapTimer = Timer(kDoubleTapTimeout, () => _middleTapTimer = null);
+  }
+
+  /// Turns a stored zone layout into pixels. A null field falls back to the
+  /// screen-derived default, which is what keeps "default" meaningful when the
+  /// window is resized or the device is rotated.
+  _EdgeZoneGeometry _resolveZone(bool left, Size size) {
+    final layout = _readerStore.edgeZone(left);
+    final width = (layout.width ?? (size.width * 0.18).clamp(56.0, 96.0)).clamp(
+      48.0,
+      size.width * 0.5,
+    );
+    final height =
+        (layout.height ?? (size.height * 0.26).clamp(150.0, 220.0)).clamp(
+          80.0,
+          size.height,
+        );
+    final center = (layout.centerFactor ?? 0.5) * size.height;
+    final maxTop = (size.height - height).clamp(0.0, size.height);
+    return _EdgeZoneGeometry(
+      width: width,
+      height: height,
+      top: (center - height / 2).clamp(0.0, maxTop),
+      isDefault: layout.isDefault,
+    );
+  }
+
+  void _moveZone(bool left, double dy, Size size) {
+    if (size.height <= 0) return;
+    final zone = _resolveZone(left, size);
+    final maxTop = (size.height - zone.height).clamp(0.0, size.height);
+    final top = (zone.top + dy).clamp(0.0, maxTop);
+    _readerStore.setEdgeZone(
+      left,
+      _readerStore
+          .edgeZone(left)
+          .copyWith(centerFactor: (top + zone.height / 2) / size.height),
+    );
+  }
+
+  void _resizeZone(bool left, double dx, double dy, Size size) {
+    final zone = _resolveZone(left, size);
+    _readerStore.setEdgeZone(
+      left,
+      _readerStore.edgeZone(left).copyWith(
+        width: (zone.width + dx).clamp(48.0, size.width * 0.5),
+        height: (zone.height + dy).clamp(80.0, size.height),
+      ),
+    );
+  }
+
+  void _hideEdgeHint() {
+    _middleTapTimer?.cancel();
+    _middleTapTimer = null;
+    if (_edgeHintVisible) setState(() => _edgeHintVisible = false);
+  }
+
+  /// Keyboard bindings stay out of the way while a text field owns the caret.
+  void _onShortcut(VoidCallback action) {
+    final focused = FocusManager.instance.primaryFocus?.context;
+    if (focused?.findAncestorStateOfType<EditableTextState>() != null) return;
+    action();
+  }
+
+  /// The Android system back key walks the reader's own history before it is
+  /// allowed to close the app.
+  Future<void> _handleSystemBack() async {
+    if (_drawerOpen) {
+      setState(() => _drawerOpen = false);
+      return;
+    }
+    if (_controller.canGoBack) {
+      _goBack();
+      return;
+    }
+    final now = DateTime.now();
+    final previous = _lastBackPress;
+    if (previous != null &&
+        now.difference(previous) < const Duration(seconds: 2)) {
+      await SystemNavigator.pop();
+      return;
+    }
+    _lastBackPress = now;
+    _showMessage('再按一次返回键退出');
+  }
+
+  int get _currentPage => _controller.document?.currentPage ?? 1;
+
+  int get _pageCount {
+    final document = _controller.document;
+    if (document == null) return 1;
+    return document.pageCount ?? document.currentPage ?? 1;
+  }
+
+  void _goToRelativePage(int delta) {
+    final uri = _uriForPage(_currentPage + delta);
+    if (uri == null) return;
+    setState(() => _drawerOpen = false);
+    unawaited(_controller.openLink(uri));
+  }
+
+  /// Prefers a page link the site itself published, and falls back to the
+  /// canonical `/view/<id>-<page>` and `/form-<board>-<page>/` shapes.
+  Uri? _uriForPage(int page) {
+    final document = _controller.document;
+    if (document == null || page < 1 || page > _pageCount) return null;
+    if (page == _currentPage) return null;
+    for (final link in document.pagination) {
+      if (link.pageNumber == page) return link.uri;
+    }
+    final threadId = document.threadId;
+    if (threadId != null) {
+      final suffix = document.uri.path.endsWith('-icchi') ? '-icchi' : '';
+      return document.uri.replace(
+        path: '/view/$threadId-$page$suffix',
+        query: null,
+        fragment: null,
+      );
+    }
+    final board = _boardPath.firstMatch(document.uri.path);
+    if (board != null) {
+      return document.uri.replace(
+        path: '/form-${board.group(1)}-$page/',
+        query: null,
+        fragment: null,
+      );
+    }
+    return null;
+  }
+
+  Future<void> _promptJumpToFloor() async {
+    final document = _controller.document;
+    if (document == null || document.kind != ForumPageKind.thread) {
+      _showMessage('只有帖子页可以跳转楼层');
+      return;
+    }
+    setState(() => _drawerOpen = false);
+    final floor = await showDialog<int>(
+      context: context,
+      builder: (context) => _JumpToFloorDialog(currentFloor: _currentFloor),
+    );
+    if (floor != null && mounted) _jumpToFloorNumber(floor);
+  }
+
+  void _jumpToFloorNumber(int floor) {
+    final document = _controller.document;
+    final threadId = document?.threadId;
+    if (document == null || threadId == null || floor < 1) return;
+
+    final targetPage = ((floor - 1) ~/ _postsPerPage) + 1;
+    if (targetPage > _pageCount) {
+      _showMessage('这个帖子还没有第 $floor 楼');
+      return;
+    }
+    if (targetPage == _currentPage) {
+      if (!document.posts.any((post) => post.numericNumber == floor)) {
+        _showMessage('这一页没有第 $floor 楼');
+        return;
+      }
+      setState(() {
+        _currentFloor = floor;
+        _jumpFloor = floor;
+        _jumpNonce++;
+      });
+      return;
+    }
+
+    _pendingJumpThread = threadId;
+    _pendingProgressFloor = floor;
+    final suffix = document.uri.path.endsWith('-icchi') ? '-icchi' : '';
+    unawaited(
+      _controller.openLink(
+        document.uri.resolve('/view/$threadId-$targetPage$suffix'),
+      ),
+    );
   }
 
   Future<bool> _createThread(String title, String content) async {
@@ -404,46 +704,294 @@ class _ViewerPageState extends State<ViewerPage> {
   }
 }
 
-class _EdgeTapSurface extends StatelessWidget {
+/// Where one edge zone currently sits, after the reader's own adjustments.
+class _EdgeZoneGeometry {
+  const _EdgeZoneGeometry({
+    required this.width,
+    required this.height,
+    required this.top,
+    required this.isDefault,
+  });
+
+  final double width;
+  final double height;
+  final double top;
+  final bool isDefault;
+
+  double get bottom => top + height;
+}
+
+class _EdgeTapSurface extends StatefulWidget {
   const _EdgeTapSurface({
     required this.size,
-    required this.edgeWidth,
-    required this.edgeHeight,
+    required this.leftZone,
+    required this.rightZone,
     required this.enabled,
     required this.canRefresh,
     required this.onRefresh,
     required this.onOpenPanel,
+    required this.hintVisible,
+    required this.onMiddleTap,
+    required this.onHideHint,
+    required this.onZoneMoved,
+    required this.onZoneResized,
+    required this.onZoneReset,
     required this.child,
   });
 
   final Size size;
-  final double edgeWidth;
-  final double edgeHeight;
+  final _EdgeZoneGeometry leftZone;
+  final _EdgeZoneGeometry rightZone;
   final bool enabled;
   final bool canRefresh;
   final VoidCallback onRefresh;
   final VoidCallback onOpenPanel;
+
+  /// Whether the otherwise invisible zones are being shown as a reminder.
+  final bool hintVisible;
+  final VoidCallback onMiddleTap;
+  final VoidCallback onHideHint;
+
+  /// Adjustments are reported as deltas; the page owns the stored layout.
+  final void Function(bool left, double dy) onZoneMoved;
+  final void Function(bool left, double dx, double dy) onZoneResized;
+  final void Function(bool left) onZoneReset;
   final Widget child;
 
   @override
+  State<_EdgeTapSurface> createState() => _EdgeTapSurfaceState();
+}
+
+class _EdgeTapSurfaceState extends State<_EdgeTapSurface> {
+  static const _tapSlop = 12.0;
+
+  Offset? _downPosition;
+
+  @override
   Widget build(BuildContext context) {
-    return GestureDetector(
-      key: const Key('edge-tap-surface'),
-      behavior: HitTestBehavior.translucent,
-      onTapUp: enabled ? _handleTap : null,
-      child: child,
+    return Listener(
+      // Raw pointers, because the text's SelectionArea wins the gesture arena
+      // for taps. Long press still reaches it and still selects text.
+      onPointerDown: (event) => _downPosition = event.localPosition,
+      onPointerUp: _handlePointerUp,
+      onPointerCancel: (_) => _downPosition = null,
+      child: GestureDetector(
+        key: const Key('edge-tap-surface'),
+        behavior: HitTestBehavior.translucent,
+        onTapUp: widget.enabled ? _handleTap : null,
+        child: Stack(
+          children: [
+            Positioned.fill(
+              child: NotificationListener<ScrollNotification>(
+                // Scrolling counts as an action, so the reminder gets out of
+                // the way as soon as reading resumes.
+                onNotification: (notification) {
+                  if (widget.hintVisible &&
+                      notification is ScrollUpdateNotification) {
+                    widget.onHideHint();
+                  }
+                  return false;
+                },
+                child: widget.child,
+              ),
+            ),
+            if (widget.hintVisible) ...[
+              ..._buildZone(left: true),
+              ..._buildZone(left: false),
+            ],
+          ],
+        ),
+      ),
     );
   }
 
-  void _handleTap(TapUpDetails details) {
-    final position = details.localPosition;
-    final edgeTop = (size.height - edgeHeight) / 2;
-    if (position.dy < edgeTop || position.dy > edgeTop + edgeHeight) return;
-    if (position.dx <= edgeWidth) {
-      if (canRefresh) onRefresh();
-    } else if (position.dx >= size.width - edgeWidth) {
-      onOpenPanel();
+  /// The reset button lives in the full-screen stack rather than inside the
+  /// zone: a child hanging past its parent's bounds paints but cannot be hit.
+  Rect? _resetButtonRect(bool left) {
+    final zone = left ? widget.leftZone : widget.rightZone;
+    if (zone.isDefault) return null;
+    const gap = 6.0;
+    const side = 32.0;
+    final x =
+        left ? zone.width + gap : widget.size.width - zone.width - gap - side;
+    return Rect.fromLTWH(x, zone.top, side, side);
+  }
+
+  List<Widget> _buildZone({required bool left}) {
+    final zone = left ? widget.leftZone : widget.rightZone;
+    final reset = _resetButtonRect(left);
+    return [
+      Positioned(
+        left: left ? 0 : null,
+        right: left ? null : 0,
+        top: zone.top,
+        width: zone.width,
+        height: zone.height,
+        child: _EdgeHint(
+          // On the hint itself, not the Positioned, so tests can measure it.
+          key: Key(left ? 'edge-hint-left' : 'edge-hint-right'),
+          label: left ? '刷新' : '阅读工具',
+          left: left,
+          onTap: () {
+            widget.onHideHint();
+            if (left) {
+              if (widget.canRefresh) widget.onRefresh();
+            } else {
+              widget.onOpenPanel();
+            }
+          },
+          onMove: (delta) => widget.onZoneMoved(left, delta.dy),
+          onResize: (delta) => widget.onZoneResized(left, delta.dx, delta.dy),
+        ),
+      ),
+      if (reset != null)
+        Positioned.fromRect(
+          rect: reset,
+          child: Material(
+            color: const Color(0xccf6f4ed),
+            shape: const RoundedRectangleBorder(
+              side: BorderSide(color: Colors.black),
+            ),
+            child: IconButton(
+              key: Key(left ? 'edge-reset-left' : 'edge-reset-right'),
+              tooltip: '恢复默认大小和位置',
+              padding: EdgeInsets.zero,
+              iconSize: 18,
+              onPressed: () => widget.onZoneReset(left),
+              icon: const Icon(Icons.settings_backup_restore),
+            ),
+          ),
+        ),
+    ];
+  }
+
+  bool _inEdgeZone(Offset position) {
+    final left = widget.leftZone;
+    if (position.dx <= left.width &&
+        position.dy >= left.top &&
+        position.dy <= left.bottom) {
+      return true;
     }
+    final right = widget.rightZone;
+    return position.dx >= widget.size.width - right.width &&
+        position.dy >= right.top &&
+        position.dy <= right.bottom;
+  }
+
+  void _handlePointerUp(PointerUpEvent event) {
+    final down = _downPosition;
+    _downPosition = null;
+    if (!widget.enabled || down == null) return;
+    // A drag is a scroll, not a tap, and the edges run their own actions.
+    if ((event.localPosition - down).distance > _tapSlop) return;
+    if (_inEdgeZone(down)) return;
+    // Working the reset button is an adjustment, not a tap somewhere else.
+    if (widget.hintVisible &&
+        ((_resetButtonRect(true)?.contains(down) ?? false) ||
+            (_resetButtonRect(false)?.contains(down) ?? false))) {
+      return;
+    }
+    widget.onMiddleTap();
+  }
+
+  void _handleTap(TapUpDetails details) {
+    // While the zones are on screen they handle their own taps, along with
+    // dragging and resizing.
+    if (widget.hintVisible) return;
+    final position = details.localPosition;
+    if (!_inEdgeZone(position)) return;
+    widget.onHideHint();
+    if (position.dx <= widget.leftZone.width) {
+      if (widget.canRefresh) widget.onRefresh();
+    } else {
+      widget.onOpenPanel();
+    }
+  }
+}
+
+/// The translucent stand-in for an edge zone, shown only after a double tap.
+/// While it is up the zone can be dragged and resized; the reset button only
+/// appears once the zone has actually been moved from its default.
+class _EdgeHint extends StatelessWidget {
+  const _EdgeHint({
+    required this.label,
+    required this.left,
+    required this.onTap,
+    required this.onMove,
+    required this.onResize,
+    super.key,
+  });
+
+  static const _handleSize = 26.0;
+
+  final String label;
+  final bool left;
+  final VoidCallback onTap;
+  final ValueChanged<Offset> onMove;
+  final ValueChanged<Offset> onResize;
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      clipBehavior: Clip.none,
+      children: [
+        Positioned.fill(
+          child: GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            onTap: onTap,
+            onPanUpdate: (details) => onMove(details.delta),
+            child: Container(
+              decoration: BoxDecoration(
+                color: const Color(0x59808080),
+                border: Border.all(color: const Color(0x73000000)),
+              ),
+              alignment: Alignment.center,
+              child: Text(
+                label,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  fontFamily: 'Saitamaar',
+                  fontSize: 15,
+                  height: 1.2,
+                  color: Color(0xdd000000),
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ),
+          ),
+        ),
+        // Resize grip on the inner corner, away from the screen edge.
+        Positioned(
+          left: left ? null : 0,
+          right: left ? 0 : null,
+          bottom: 0,
+          width: _handleSize,
+          height: _handleSize,
+          child: GestureDetector(
+            key: Key(left ? 'edge-resize-left' : 'edge-resize-right'),
+            behavior: HitTestBehavior.opaque,
+            onPanUpdate:
+                (details) => onResize(
+                  // Dragging away from the screen edge grows the zone.
+                  Offset(left ? details.delta.dx : -details.delta.dx,
+                      details.delta.dy),
+                ),
+            child: Container(
+              color: const Color(0x66000000),
+              alignment: Alignment.center,
+              child: Transform.rotate(
+                angle: left ? 0 : 1.5708,
+                child: const Icon(
+                  Icons.open_in_full,
+                  size: 15,
+                  color: Colors.white,
+                ),
+              ),
+            ),
+          ),
+        ),
+      ],
+    );
   }
 }
 
@@ -582,19 +1130,289 @@ class _MessageBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
-      color: isError ? const Color(0xffffcccc) : const Color(0xffccffcc),
-      child: Text(
-        message,
-        style: TextStyle(
-          fontFamily: 'Saitamaar',
-          fontSize: 14,
-          color: isError ? const Color(0xff880000) : Colors.black,
+    // Purely informational, so it never takes a pointer away from the page
+    // underneath and stays see-through enough to read the AA behind it.
+    return IgnorePointer(
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
+        color: isError ? const Color(0xccffcccc) : const Color(0xccccffcc),
+        child: Text(
+          message,
+          style: TextStyle(
+            fontFamily: 'Saitamaar',
+            fontSize: 14,
+            color: isError ? const Color(0xff880000) : Colors.black,
+          ),
         ),
       ),
     );
+  }
+}
+
+/// Classic-styled toolbar shown on desktop only. Every entry has a keyboard
+/// equivalent, listed in its tooltip.
+class _DesktopToolbar extends StatelessWidget {
+  const _DesktopToolbar({
+    required this.canGoBack,
+    required this.canGoForward,
+    required this.canReload,
+    required this.currentPage,
+    required this.pageCount,
+    required this.isThread,
+    required this.onBack,
+    required this.onForward,
+    required this.onReload,
+    required this.onHome,
+    required this.onBoardList,
+    required this.onPreviousPage,
+    required this.onNextPage,
+    required this.onJumpToFloor,
+    required this.onOpenPanel,
+  });
+
+  final bool canGoBack;
+  final bool canGoForward;
+  final bool canReload;
+  final int currentPage;
+  final int pageCount;
+  final bool isThread;
+  final VoidCallback onBack;
+  final VoidCallback onForward;
+  final VoidCallback onReload;
+  final VoidCallback onHome;
+  final VoidCallback onBoardList;
+  final VoidCallback onPreviousPage;
+  final VoidCallback onNextPage;
+  final VoidCallback onJumpToFloor;
+  final VoidCallback onOpenPanel;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      key: const Key('desktop-toolbar'),
+      color: const Color(0xffefefef),
+      padding: const EdgeInsets.fromLTRB(4, 3, 4, 3),
+      child: Row(
+        children: [
+          // A narrow window scrolls the controls instead of clipping them.
+          Expanded(
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(children: _buildControls()),
+            ),
+          ),
+          _ToolbarCell(
+            key: const Key('toolbar-panel'),
+            label: '■阅读工具■',
+            tooltip: '书签、登录、发帖、显示大小',
+            onTap: onOpenPanel,
+          ),
+        ],
+      ),
+    );
+  }
+
+  List<Widget> _buildControls() {
+    return [
+          _ToolbarCell(
+            key: const Key('toolbar-back'),
+            label: '■后退■',
+            tooltip: '后退（Alt+←）',
+            enabled: canGoBack,
+            onTap: onBack,
+          ),
+          _ToolbarCell(
+            key: const Key('toolbar-forward'),
+            label: '■前进■',
+            tooltip: '前进（Alt+→）',
+            enabled: canGoForward,
+            onTap: onForward,
+          ),
+          _ToolbarCell(
+            key: const Key('toolbar-reload'),
+            label: '■刷新■',
+            tooltip: '刷新（F5）',
+            enabled: canReload,
+            onTap: onReload,
+          ),
+          const SizedBox(width: 8),
+          _ToolbarCell(
+            key: const Key('toolbar-home'),
+            label: '■首页■',
+            tooltip: '回到首页（Alt+Home）',
+            onTap: onHome,
+          ),
+          _ToolbarCell(
+            key: const Key('toolbar-board'),
+            label: '■帖子一览■',
+            tooltip: '打开帖子一览',
+            onTap: onBoardList,
+          ),
+          const SizedBox(width: 8),
+          _ToolbarCell(
+            key: const Key('toolbar-previous-page'),
+            label: '◀',
+            tooltip: '上一页（Ctrl+PageUp）',
+            enabled: currentPage > 1,
+            onTap: onPreviousPage,
+          ),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 5),
+            child: Text(
+              '$currentPage / $pageCount',
+              key: const Key('toolbar-page-indicator'),
+              style: const TextStyle(
+                fontFamily: 'Saitamaar',
+                fontSize: 16,
+                height: 1,
+                color: Colors.black,
+              ),
+            ),
+          ),
+          _ToolbarCell(
+            key: const Key('toolbar-next-page'),
+            label: '▶',
+            tooltip: '下一页（Ctrl+PageDown）',
+            enabled: currentPage < pageCount,
+            onTap: onNextPage,
+          ),
+          const SizedBox(width: 8),
+          _ToolbarCell(
+            key: const Key('toolbar-jump-floor'),
+            label: '■跳楼层■',
+            tooltip: '跳到指定楼层（Ctrl+G）',
+            enabled: isThread,
+            onTap: onJumpToFloor,
+          ),
+        ];
+  }
+}
+
+class _ToolbarCell extends StatelessWidget {
+  const _ToolbarCell({
+    required this.label,
+    required this.tooltip,
+    required this.onTap,
+    this.enabled = true,
+    super.key,
+  });
+
+  static const _padding = EdgeInsets.symmetric(horizontal: 7, vertical: 5);
+
+  final String label;
+  final String tooltip;
+  final VoidCallback onTap;
+  final bool enabled;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tooltip,
+      waitDuration: const Duration(milliseconds: 500),
+      child: Container(
+        margin: const EdgeInsets.symmetric(horizontal: 1.5),
+        decoration: BoxDecoration(
+          border: Border.all(
+            color: enabled ? Colors.black : const Color(0xffaaaaaa),
+          ),
+        ),
+        child:
+            enabled
+                ? ClassicLink(label, padding: _padding, onTap: onTap)
+                : Padding(
+                  padding: _padding,
+                  child: Text(
+                    label,
+                    style: const TextStyle(
+                      fontFamily: 'Saitamaar',
+                      fontSize: 16,
+                      height: 1,
+                      color: Color(0xffaaaaaa),
+                    ),
+                  ),
+                ),
+      ),
+    );
+  }
+}
+
+/// Asks for a floor number. Returns the parsed floor, or null when cancelled.
+class _JumpToFloorDialog extends StatefulWidget {
+  const _JumpToFloorDialog({this.currentFloor});
+
+  final int? currentFloor;
+
+  @override
+  State<_JumpToFloorDialog> createState() => _JumpToFloorDialogState();
+}
+
+class _JumpToFloorDialogState extends State<_JumpToFloorDialog> {
+  final _controller = TextEditingController();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      key: const Key('jump-to-floor-dialog'),
+      backgroundColor: const Color(0xfff6f4ed),
+      shape: const RoundedRectangleBorder(
+        side: BorderSide(color: Colors.black),
+      ),
+      title: const Text(
+        '跳转楼层',
+        style: TextStyle(fontFamily: 'Saitamaar', fontSize: 18, height: 1),
+      ),
+      content: TextField(
+        key: const Key('jump-to-floor-input'),
+        controller: _controller,
+        autofocus: true,
+        keyboardType: TextInputType.number,
+        inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+        onSubmitted: (_) => _submit(),
+        style: const TextStyle(
+          fontFamily: 'Saitamaar',
+          fontSize: 16,
+          height: 1,
+        ),
+        decoration: InputDecoration(
+          hintText:
+              widget.currentFloor == null
+                  ? '楼层号'
+                  : '楼层号（当前 #${widget.currentFloor}）',
+          filled: true,
+          fillColor: Colors.white,
+          isDense: true,
+          contentPadding: const EdgeInsets.all(9),
+          border: const OutlineInputBorder(borderRadius: BorderRadius.zero),
+          enabledBorder: const OutlineInputBorder(
+            borderRadius: BorderRadius.zero,
+            borderSide: BorderSide(color: Colors.black),
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('取消'),
+        ),
+        TextButton(
+          key: const Key('jump-to-floor-confirm'),
+          onPressed: _submit,
+          child: const Text('跳转'),
+        ),
+      ],
+    );
+  }
+
+  void _submit() {
+    final floor = int.tryParse(_controller.text.trim());
+    Navigator.pop(context, floor != null && floor > 0 ? floor : null);
   }
 }
 
@@ -664,6 +1482,12 @@ class _HomeView extends StatelessWidget {
 class _HomeHeader extends StatelessWidget {
   const _HomeHeader({required this.document, required this.onNavigate});
 
+  /// Matches the site table's `cellspacing="7"` and `cellpadding="3"`, with
+  /// the gap sandwiched between the outer rule and the cells halved.
+  static const _cellSpacing = 7.0;
+  static const _frameGap = 3.5;
+  static const _cellPadding = EdgeInsets.all(3);
+
   final ForumDocument document;
   final ValueChanged<Uri> onNavigate;
 
@@ -683,16 +1507,22 @@ class _HomeHeader extends StatelessWidget {
                 : '当前昵称：互联网的无名者')
             .replaceAll(RegExp(r'\s*■?修改■?\s*'), '')
             .trim();
-    return _DoubleClassicFrame(
+    // Mirrors the site's `<table border=1 cellspacing=7 cellpadding=3>`: one
+    // outer rule, then a single thin rule per cell.
+    return Container(
+      key: const Key('home-notice-table'),
       width: double.infinity,
       margin: const EdgeInsets.fromLTRB(5, 5, 5, 8),
-      color: const Color(0xffccffcc),
+      padding: const EdgeInsets.all(_frameGap),
+      decoration: BoxDecoration(
+        color: const Color(0xffccffcc),
+        border: Border.fromBorderSide(classicRule(context)),
+      ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          const _DoubleClassicFrame(
-            color: Color(0xffccffcc),
-            innerPadding: EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+          const _NoticeCell(
+            padding: _cellPadding,
             child: Text(
               'AA同好会揭示板',
               textAlign: TextAlign.center,
@@ -704,10 +1534,9 @@ class _HomeHeader extends StatelessWidget {
               ),
             ),
           ),
-          const SizedBox(height: 2),
-          _DoubleClassicFrame(
-            color: const Color(0xffccffcc),
-            innerPadding: const EdgeInsets.symmetric(vertical: 5),
+          const SizedBox(height: _cellSpacing),
+          _NoticeCell(
+            padding: _cellPadding,
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
@@ -730,41 +1559,42 @@ class _HomeHeader extends StatelessWidget {
               ],
             ),
           ),
-          const SizedBox(height: 2),
+          const SizedBox(height: _cellSpacing),
           IntrinsicHeight(
             child: Row(
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 Expanded(
                   flex: 2,
-                  child: _DoubleClassicFrame(
-                    color: const Color(0xffccffcc),
-                    innerPadding: const EdgeInsets.all(6),
-                    child: Center(
-                      child: ClassicLink(
-                        '■帖子一览■',
-                        bold: true,
-                        fontSize: 13,
-                        onTap:
-                            () =>
-                                onNavigate(document.uri.resolve('/form-1-1/')),
-                      ),
+                  child: _NoticeCell(
+                    // The link owns the cell so the whole box stays tappable
+                    // even at the site's tight three-pixel padding.
+                    padding: EdgeInsets.zero,
+                    child: ClassicLink(
+                      '■帖子一览■',
+                      bold: true,
+                      fontSize: 13,
+                      padding: _cellPadding,
+                      expand: true,
+                      onTap:
+                          () => onNavigate(document.uri.resolve('/form-1-1/')),
                     ),
                   ),
                 ),
-                const SizedBox(width: 2),
+                const SizedBox(width: _cellSpacing),
                 Expanded(
                   flex: 3,
-                  child: _DoubleClassicFrame(
-                    color: const Color(0xffccffcc),
-                    innerPadding: const EdgeInsets.all(6),
-                    child: Text(
-                      session,
-                      textAlign: TextAlign.center,
-                      style: const TextStyle(
-                        fontFamily: 'Saitamaar',
-                        fontSize: 14,
-                        height: 1,
+                  child: _NoticeCell(
+                    padding: _cellPadding,
+                    child: Center(
+                      child: Text(
+                        session,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                          fontFamily: 'Saitamaar',
+                          fontSize: 16,
+                          height: 1,
+                        ),
                       ),
                     ),
                   ),
@@ -778,42 +1608,35 @@ class _HomeHeader extends StatelessWidget {
   }
 }
 
-class _DoubleClassicFrame extends StatelessWidget {
-  const _DoubleClassicFrame({
-    required this.child,
-    required this.color,
-    this.width,
-    this.margin = EdgeInsets.zero,
-    this.innerPadding = EdgeInsets.zero,
-  });
+/// A one-physical-pixel rule, the width a browser draws for `border="1"`.
+/// A whole logical pixel reads as a heavy stroke on a high-density screen.
+BorderSide classicRule(BuildContext context) => BorderSide(
+  color: Colors.black,
+  width: 1 / MediaQuery.devicePixelRatioOf(context),
+);
+
+/// One cell of the homepage notice table: a single thin rule, nothing else.
+class _NoticeCell extends StatelessWidget {
+  const _NoticeCell({required this.child, required this.padding});
 
   final Widget child;
-  final Color color;
-  final double? width;
-  final EdgeInsetsGeometry margin;
-  final EdgeInsetsGeometry innerPadding;
+  final EdgeInsetsGeometry padding;
 
   @override
   Widget build(BuildContext context) {
     return Container(
-      width: width,
-      margin: margin,
-      padding: const EdgeInsets.all(2),
+      padding: padding,
       decoration: BoxDecoration(
-        color: color,
-        border: Border.all(color: Colors.black, width: 0.5),
+        border: Border.fromBorderSide(classicRule(context)),
       ),
-      child: Container(
-        padding: innerPadding,
-        decoration: BoxDecoration(
-          color: color,
-          border: Border.all(color: Colors.black, width: 0.5),
-        ),
-        child: child,
-      ),
+      child: child,
     );
   }
 }
+
+/// Thread titles are the most-tapped links in the reader, so they carry real
+/// slack above and below the glyphs instead of a bare text-sized target.
+const _threadTitleHitPadding = EdgeInsets.fromLTRB(2, 6, 12, 8);
 
 class _HomeThreadPreview extends StatelessWidget {
   const _HomeThreadPreview({required this.thread, required this.onNavigate});
@@ -823,18 +1646,20 @@ class _HomeThreadPreview extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // `<table border=1 cellspacing=7 cellpadding=3>` with a single cell: the
+    // two rules belong there, but they need the site's 7px gap between them.
     return Container(
       width: double.infinity,
       margin: const EdgeInsets.fromLTRB(5, 0, 5, 8),
-      padding: const EdgeInsets.all(2),
+      padding: const EdgeInsets.all(3.5),
       decoration: BoxDecoration(
         color: const Color(0xffefefef),
-        border: Border.all(color: Colors.black, width: 0.5),
+        border: Border.fromBorderSide(classicRule(context)),
       ),
       child: Container(
         padding: const EdgeInsets.all(3),
         decoration: BoxDecoration(
-          border: Border.all(color: Colors.black, width: 0.5),
+          border: Border.fromBorderSide(classicRule(context)),
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -843,9 +1668,9 @@ class _HomeThreadPreview extends StatelessWidget {
               thread.title,
               bold: true,
               fontSize: 24,
+              padding: _threadTitleHitPadding,
               onTap: () => onNavigate(thread.uri),
             ),
-            const SizedBox(height: 4),
             for (final post in thread.previewPosts) PostCard(post: post),
           ],
         ),
@@ -908,6 +1733,7 @@ class _ThreadSummaryRow extends StatelessWidget {
                     thread.title,
                     bold: true,
                     fontSize: 24,
+                    padding: _threadTitleHitPadding,
                     onTap: () => onNavigate(thread.uri),
                   ),
                   if (details.isNotEmpty)
@@ -1116,20 +1942,23 @@ class _ClassicNavigation extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    const cellPadding = _NavCell.contentPadding;
     final entries = <Widget>[
       _NavCell(
         key: const Key('nav-home'),
         child: ClassicLink(
           '■回到首页■',
+          padding: cellPadding,
           onTap: () => onNavigate(document.uri.resolve('/')),
         ),
       ),
-      if (document.ownerOnlyUri != null)
+      if (document.ownerFilter != null)
         _NavCell(
           key: const Key('nav-owner-only'),
           child: ClassicLink(
-            '■只看贴主■',
-            onTap: () => onNavigate(document.ownerOnlyUri!),
+            document.ownerFilter!.title,
+            padding: cellPadding,
+            onTap: () => onNavigate(document.ownerFilter!.uri),
           ),
         ),
     ];
@@ -1139,7 +1968,10 @@ class _ClassicNavigation extends StatelessWidget {
       if (page == null) continue;
       if (previousPage != null && page - previousPage > 1) {
         entries.add(
-          _NavCell(key: ValueKey('nav-gap-$page'), child: const Text('....')),
+          _NavCell(
+            key: ValueKey('nav-gap-$page'),
+            child: const Padding(padding: cellPadding, child: Text('....')),
+          ),
         );
       }
       entries.add(
@@ -1147,15 +1979,22 @@ class _ClassicNavigation extends StatelessWidget {
           key: ValueKey('nav-page-$page'),
           child:
               page == document.currentPage
-                  ? Text(
-                    '$page',
-                    style: const TextStyle(
-                      fontFamily: 'Saitamaar',
-                      fontSize: 16,
-                      height: 1,
+                  ? Padding(
+                    padding: cellPadding,
+                    child: Text(
+                      '$page',
+                      style: const TextStyle(
+                        fontFamily: 'Saitamaar',
+                        fontSize: 16,
+                        height: 1,
+                      ),
                     ),
                   )
-                  : ClassicLink('$page', onTap: () => onNavigate(link.uri)),
+                  : ClassicLink(
+                    '$page',
+                    padding: cellPadding,
+                    onTap: () => onNavigate(link.uri),
+                  ),
         ),
       );
       previousPage = page;
@@ -1171,15 +2010,23 @@ class _ClassicNavigation extends StatelessWidget {
 class _NavCell extends StatelessWidget {
   const _NavCell({required this.child, super.key});
 
+  /// Owned by the cell's child rather than the cell, so tapping anywhere
+  /// inside the border counts — the cell keeps its original size either way.
+  static const contentPadding = EdgeInsets.symmetric(
+    horizontal: 4,
+    vertical: 2,
+  );
+
   final Widget child;
 
   @override
   Widget build(BuildContext context) {
     return Container(
       margin: const EdgeInsets.symmetric(horizontal: 1.5),
-      padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
       alignment: Alignment.center,
-      decoration: BoxDecoration(border: Border.all(color: Colors.black)),
+      decoration: BoxDecoration(
+        border: Border.fromBorderSide(classicRule(context)),
+      ),
       child: DefaultTextStyle(
         style: const TextStyle(
           fontFamily: 'Saitamaar',

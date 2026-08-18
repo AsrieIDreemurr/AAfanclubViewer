@@ -71,6 +71,9 @@ class _AaPickerPageState extends State<AaPickerPage> {
         _loadingTree = false;
         _treeError = null;
       });
+      // Pick up where the last visit left off instead of at the tree root.
+      final last = _store.pageHistory.firstOrNull;
+      if (last != null) unawaited(_openFile(last.toSourceNode()));
     } catch (error) {
       if (!mounted) return;
       setState(() {
@@ -230,15 +233,6 @@ class _AaPickerPageState extends State<AaPickerPage> {
   }
 
   Widget _buildLocationBar() {
-    final label = switch (_view) {
-      _AaPickerView.favorites => '收藏',
-      _AaPickerView.history => '历史',
-      _AaPickerView.browse =>
-        _selectedFile?.fullPath ??
-            (_folderStack.isEmpty
-                ? 'AA目录'
-                : _folderStack.map((item) => item.filename).join('  >  ')),
-    };
     final showBack =
         _search.text.isNotEmpty ||
         _view != _AaPickerView.browse ||
@@ -256,14 +250,7 @@ class _AaPickerPageState extends State<AaPickerPage> {
             )
           else
             const SizedBox(width: 12),
-          Expanded(
-            child: Text(
-              label,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-            ),
-          ),
+          Expanded(child: _buildBreadcrumbs()),
           if (_view == _AaPickerView.browse && _selectedFile != null)
             IconButton(
               key: ValueKey('aa-page-favorite-${_selectedFile!.hash}'),
@@ -290,6 +277,95 @@ class _AaPickerPageState extends State<AaPickerPage> {
             const SizedBox(width: 10),
         ],
       ),
+    );
+  }
+
+  /// The location turned into a `/`-separated trail. Every folder in it jumps
+  /// to that level, including when the file was reached from history, a
+  /// favorite or a search result and the browser never walked the tree.
+  Widget _buildBreadcrumbs() {
+    if (_view != _AaPickerView.browse) {
+      return Text(
+        _view == _AaPickerView.favorites ? '收藏' : '历史',
+        style: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+      );
+    }
+
+    const style = TextStyle(fontSize: 16, fontWeight: FontWeight.bold);
+    const linkStyle = TextStyle(
+      fontSize: 16,
+      fontWeight: FontWeight.bold,
+      color: Color(0xff0b57d0),
+    );
+    final crumbs = <Widget>[
+      InkWell(
+        key: const Key('aa-crumb-root'),
+        onTap: () => _openFolderPath(const []),
+        child: const Padding(
+          padding: EdgeInsets.symmetric(horizontal: 4, vertical: 8),
+          child: Text('AA目录', style: linkStyle),
+        ),
+      ),
+    ];
+
+    void addFolder(AaSourceNode folder) {
+      crumbs
+        ..add(const Text('/', style: style))
+        ..add(
+          InkWell(
+            key: ValueKey('aa-crumb-${folder.hash}'),
+            onTap: () => _openFolderNode(folder),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 8),
+              child: Text(folder.filename, style: linkStyle),
+            ),
+          ),
+        );
+    }
+
+    final file = _selectedFile;
+    if (file == null) {
+      for (final folder in _folderStack) {
+        addFolder(folder);
+      }
+    } else {
+      var path = '';
+      for (final part in file.directory.split('/')) {
+        if (part.isEmpty) continue;
+        path = '$path/$part';
+        final folder = _folderForPath(path);
+        if (folder == null) {
+          crumbs
+            ..add(const Text('/', style: style))
+            ..add(
+              Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 4),
+                child: Text(part, style: style),
+              ),
+            );
+        } else {
+          addFolder(folder);
+        }
+      }
+      crumbs
+        ..add(const Text('/', style: style))
+        ..add(
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 4),
+            child: Text(
+              file.displayName,
+              key: const Key('aa-crumb-current-file'),
+              style: style,
+            ),
+          ),
+        );
+    }
+
+    return SingleChildScrollView(
+      key: const Key('aa-breadcrumbs'),
+      scrollDirection: Axis.horizontal,
+      reverse: true,
+      child: Row(children: crumbs),
     );
   }
 
@@ -326,7 +402,14 @@ class _AaPickerPageState extends State<AaPickerPage> {
               node.isFile
                   ? Text('${(node.filesize / 1024).toStringAsFixed(1)} KiB')
                   : null,
-          trailing: const Icon(Icons.chevron_right),
+          trailing:
+              node.isFile
+                  ? const Icon(Icons.chevron_right)
+                  : _FolderStar(
+                    node: node,
+                    isFavorite: _store.isFolderFavorite(node.hash),
+                    onToggle: _store.toggleFolderFavorite,
+                  ),
           onTap: () => _openNode(node),
         );
       },
@@ -384,14 +467,35 @@ class _AaPickerPageState extends State<AaPickerPage> {
   }
 
   Widget _buildFavoritePages() {
+    final folders = _store.favoriteFolders;
     final pages = _store.favoritePageGroups;
-    if (pages.isEmpty) return const Center(child: Text('还没有收藏的页面或 AA'));
+    if (folders.isEmpty && pages.isEmpty) {
+      return const Center(child: Text('还没有收藏的文件夹、页面或 AA'));
+    }
     return ListView.builder(
       key: const Key('aa-favorite-pages'),
       padding: const EdgeInsets.only(bottom: 12),
-      itemCount: pages.length,
+      itemCount: folders.length + pages.length,
       itemBuilder: (context, index) {
-        final page = pages[index];
+        if (index < folders.length) {
+          final folder = folders[index];
+          return Material(
+            color: Colors.white,
+            child: ListTile(
+              key: ValueKey('aa-favorite-folder-${folder.hash}'),
+              leading: const Icon(Icons.folder, color: Colors.black),
+              title: Text(folder.name),
+              subtitle: Text(folder.directory),
+              trailing: IconButton(
+                tooltip: '取消收藏文件夹',
+                onPressed: () => _store.toggleFolderFavorite(folder),
+                icon: const Icon(Icons.star, color: Color(0xffffa000)),
+              ),
+              onTap: () => _openSavedFolder(folder),
+            ),
+          );
+        }
+        final page = pages[index - folders.length];
         final items = _store.favoriteAasForPage(page.fileHash);
         final entries = items.map(_AaEntry.fromSaved).toList(growable: false);
         return Column(
@@ -543,6 +647,70 @@ class _AaPickerPageState extends State<AaPickerPage> {
   void _openSavedPage(AaSavedPage page) {
     _folderStack.clear();
     unawaited(_openFile(page.toSourceNode()));
+  }
+
+  /// Re-walks the live tree to the saved path, so a bookmarked folder still
+  /// opens after the source adds or renames entries around it.
+  void _openSavedFolder(AaSavedFolder folder) {
+    final path = _pathToFolder(_tree, folder.hash);
+    if (path == null) {
+      _showMessage('这个文件夹在 AA来源里已经找不到了');
+      return;
+    }
+    _openFolderPath(path);
+  }
+
+  void _openFolderNode(AaSourceNode folder) {
+    _openFolderPath(_pathToFolder(_tree, folder.hash) ?? [folder]);
+  }
+
+  void _openFolderPath(List<AaSourceNode> path) {
+    _search.clear();
+    setState(() {
+      _view = _AaPickerView.browse;
+      _selectedFile = null;
+      _fileEntries = const [];
+      _fileError = null;
+      _loadingFile = false;
+      _folderStack
+        ..clear()
+        ..addAll(path);
+    });
+  }
+
+  /// Finds the folder whose own full path is [path]; a file's `directory`
+  /// string is exactly the full path of the folder holding it.
+  AaSourceNode? _folderForPath(String path) {
+    AaSourceNode? search(Iterable<AaSourceNode> nodes) {
+      for (final node in nodes) {
+        if (node.isFile) continue;
+        if (node.fullPath == path) return node;
+        final deeper = search(node.children);
+        if (deeper != null) return deeper;
+      }
+      return null;
+    }
+
+    return search(_tree);
+  }
+
+  static List<AaSourceNode>? _pathToFolder(
+    Iterable<AaSourceNode> nodes,
+    String hash,
+  ) {
+    for (final node in nodes) {
+      if (node.isFile) continue;
+      if (node.hash == hash) return [node];
+      final deeper = _pathToFolder(node.children, hash);
+      if (deeper != null) return [node, ...deeper];
+    }
+    return null;
+  }
+
+  void _showMessage(String message) {
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
   }
 
   void _toggleFavorite(_AaEntry entry) {
@@ -823,6 +991,31 @@ class _AaThumbnailPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant _AaThumbnailPainter oldDelegate) {
     return oldDelegate.text != text;
+  }
+}
+
+class _FolderStar extends StatelessWidget {
+  const _FolderStar({
+    required this.node,
+    required this.isFavorite,
+    required this.onToggle,
+  });
+
+  final AaSourceNode node;
+  final bool isFavorite;
+  final ValueChanged<AaSavedFolder> onToggle;
+
+  @override
+  Widget build(BuildContext context) {
+    return IconButton(
+      key: ValueKey('aa-folder-star-${node.hash}'),
+      tooltip: isFavorite ? '取消收藏文件夹' : '收藏文件夹',
+      onPressed: () => onToggle(AaSavedFolder.fromSource(node)),
+      icon: Icon(
+        isFavorite ? Icons.star : Icons.star_border,
+        color: isFavorite ? const Color(0xffffa000) : Colors.black,
+      ),
+    );
   }
 }
 

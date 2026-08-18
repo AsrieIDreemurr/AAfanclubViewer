@@ -7,7 +7,7 @@ void main() {
   setUp(() => SharedPreferences.setMockInitialValues({}));
 
   test(
-    'records the highest floor and creates floor-specific bookmarks',
+    'tracks the floor on screen and creates floor-specific bookmarks',
     () async {
       final store = ReaderStore();
       await store.load();
@@ -22,8 +22,10 @@ void main() {
       );
 
       store.recordProgress(document, 78);
-      store.recordProgress(document, 60);
       expect(store.progressFor('20')?.floor, 78);
+      // Scrolling back up moves the tab with the reader, not just forward.
+      store.recordProgress(document, 60);
+      expect(store.progressFor('20')?.floor, 60);
       expect(store.openedThreads.single.threadId, '20');
       expect(
         store.progressFor('20')?.uri,
@@ -46,8 +48,10 @@ void main() {
       );
       expect(store.progressFor('21')?.floor, 3);
 
-      store.markThreadOpened(document, 60);
-      expect(store.progressFor('20')?.floor, 78);
+      // Reopening a thread must not clobber the stored floor with whatever
+      // happens to be on screen first.
+      store.markThreadOpened(document, 1);
+      expect(store.progressFor('20')?.floor, 60);
 
       expect(store.addBookmark(document, 101), isTrue);
       expect(store.addBookmark(document, 101), isFalse);

@@ -164,11 +164,17 @@ class AaFanclubAdapter implements SiteAdapter {
   ) {
     final threadId = pathMatch.group(1)!;
     final currentPage = int.tryParse(pathMatch.group(2) ?? '') ?? 1;
-    final pagination = _threadPagination(document, uri, threadId, currentPage);
+    final ownerOnly = uri.path.endsWith('-icchi');
+    final pagination = _threadPagination(
+      document,
+      uri,
+      threadId,
+      currentPage,
+      ownerOnly: ownerOnly,
+    );
     final pageCount = pagination
         .map((link) => link.pageNumber ?? 1)
         .fold(currentPage, (highest, page) => page > highest ? page : highest);
-    final ownerAnchor = document.querySelector('a[href\$="-icchi"]');
     final heading = _cleanInline(document.querySelector('h1')?.text);
     final title =
         heading.isNotEmpty
@@ -186,11 +192,22 @@ class AaFanclubAdapter implements SiteAdapter {
       currentPage: currentPage,
       pageCount: pageCount,
       threadId: threadId,
-      ownerOnlyUri:
-          ownerAnchor == null
-              ? null
-              : uri.resolve(ownerAnchor.attributes['href']!),
+      ownerFilter: _ownerFilterLink(document, uri),
     );
+  }
+
+  /// The site flips this control between ■只看贴主■ and ■查看全部■ depending on
+  /// which view is open, so the label travels with the link.
+  ForumLink? _ownerFilterLink(Document document, Uri uri) {
+    for (final anchor in document.querySelectorAll('a[href^="/view/"]')) {
+      final label = _cleanInline(anchor.text);
+      if (!label.contains('只看贴主') && !label.contains('查看全部')) continue;
+      return ForumLink(
+        title: label,
+        uri: uri.resolve(anchor.attributes['href']!),
+      );
+    }
+    return null;
   }
 
   ForumDocument _parseFallback(Document document, Uri uri, String encoding) {
@@ -251,13 +268,17 @@ class AaFanclubAdapter implements SiteAdapter {
     Document document,
     Uri uri,
     String threadId,
-    int currentPage,
-  ) {
+    int currentPage, {
+    required bool ownerOnly,
+  }) {
     final result = <ForumLink>[
       ForumLink(title: '$currentPage', uri: uri, pageNumber: currentPage),
     ];
     final seen = <int>{currentPage};
-    final pattern = RegExp('^/view/$threadId-(\\d+)/?\$');
+    // Owner-only pages paginate as `-<page>-icchi`; matching the plain shape
+    // there would swallow the ■查看全部■ link as if it were page one.
+    final suffix = ownerOnly ? '-icchi' : '';
+    final pattern = RegExp('^/view/$threadId-(\\d+)$suffix/?\$');
     for (final anchor in document.querySelectorAll('a[href]')) {
       final href = anchor.attributes['href']!;
       final match = pattern.firstMatch(href);

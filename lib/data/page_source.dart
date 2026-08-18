@@ -48,7 +48,24 @@ class NetworkPageSource {
         (host != 'aafanclub.com' && host != 'www.aafanclub.com')) {
       throw const PageSourceException('只允许向 AA同好会揭示板提交表单');
     }
-    return _request('POST', uri, fields: fields, referer: referer);
+    return _request(
+      'POST',
+      uri,
+      fields: _withNormalizedNewlines(fields),
+      referer: referer,
+    );
+  }
+
+  /// Browsers normalise form line breaks to CRLF before posting, and the board
+  /// splits submitted text on CRLF both to insert `<br>` and to decide when a
+  /// homepage preview folds. Bare LF therefore arrives as a single long line:
+  /// `white-space: pre` still shows the breaks, but the post never folds.
+  Map<String, String> _withNormalizedNewlines(Map<String, String> fields) {
+    final pattern = RegExp(r'\r\n|\r|\n');
+    return {
+      for (final entry in fields.entries)
+        entry.key: entry.value.replaceAll(pattern, '\r\n'),
+    };
   }
 
   Future<SourcePage> _request(

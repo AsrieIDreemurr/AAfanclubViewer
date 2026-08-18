@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../application/reader_store.dart';
 import '../domain/forum_document.dart';
+import 'aligned_underline.dart';
 
 typedef LoginCallback = Future<bool> Function(String name, String trip);
 typedef CacheClearCallback = Future<bool> Function();
@@ -16,19 +17,23 @@ class ReaderSidePanel extends StatefulWidget {
     required this.bookmarks,
     required this.displayScale,
     required this.busy,
-    required this.canGoBack,
     required this.onClose,
     required this.onHome,
-    required this.onBack,
     required this.onBookmarkCurrent,
     required this.onOpenThread,
     required this.onOpenBookmark,
     required this.onRemoveBookmark,
+    required this.onRemoveThread,
     required this.onScaleChanged,
     required this.onClearCache,
     required this.onLogin,
     required this.onStartReply,
     required this.onStartNewThread,
+    required this.currentPage,
+    required this.pageCount,
+    required this.onPreviousPage,
+    required this.onNextPage,
+    required this.onJumpToFloor,
     this.login,
     super.key,
   });
@@ -39,19 +44,23 @@ class ReaderSidePanel extends StatefulWidget {
   final List<FloorBookmark> bookmarks;
   final double displayScale;
   final bool busy;
-  final bool canGoBack;
   final VoidCallback onClose;
   final VoidCallback onHome;
-  final VoidCallback onBack;
   final VoidCallback onBookmarkCurrent;
   final ValueChanged<ReadingMarker> onOpenThread;
   final ValueChanged<FloorBookmark> onOpenBookmark;
   final ValueChanged<String> onRemoveBookmark;
+  final ValueChanged<String> onRemoveThread;
   final ValueChanged<double> onScaleChanged;
   final CacheClearCallback onClearCache;
   final LoginCallback onLogin;
   final VoidCallback onStartReply;
   final VoidCallback onStartNewThread;
+  final int currentPage;
+  final int pageCount;
+  final VoidCallback onPreviousPage;
+  final VoidCallback onNextPage;
+  final VoidCallback onJumpToFloor;
   final CachedLogin? login;
 
   @override
@@ -124,22 +133,56 @@ class _ReaderSidePanelState extends State<ReaderSidePanel> {
               const Divider(height: 1, color: Colors.black),
               ConstrainedBox(
                 constraints: BoxConstraints(
-                  maxHeight: _form == _PanelForm.none ? 150 : 260,
+                  maxHeight: _form == _PanelForm.none ? 190 : 285,
                 ),
                 child: SingleChildScrollView(
                   padding: const EdgeInsets.all(7),
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      Wrap(
-                        spacing: 5,
-                        runSpacing: 5,
+                      if (widget.pageCount > 1) ...[
+                        Text(
+                          '第 ${widget.currentPage} / ${widget.pageCount} 页',
+                          key: const Key('panel-page-indicator'),
+                          style: const TextStyle(
+                            fontFamily: 'Saitamaar',
+                            fontSize: 13,
+                            height: 1,
+                          ),
+                        ),
+                        const SizedBox(height: 5),
+                      ],
+                      // Fixed rows rather than a wrap, so a button never moves
+                      // to a different place as the page state changes.
+                      _ButtonRow(
+                        children: [
+                          _ClassicButton(label: '首页', onPressed: widget.onHome),
+                          _ClassicButton(
+                            key: const Key('panel-previous-page'),
+                            label: '◀ 上一页',
+                            onPressed:
+                                widget.currentPage > 1
+                                    ? widget.onPreviousPage
+                                    : null,
+                          ),
+                          _ClassicButton(
+                            key: const Key('panel-next-page'),
+                            label: '下一页 ▶',
+                            onPressed:
+                                widget.currentPage < widget.pageCount
+                                    ? widget.onNextPage
+                                    : null,
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 5),
+                      _ButtonRow(
                         children: [
                           _ClassicButton(
-                            label: '返回',
-                            onPressed: widget.canGoBack ? widget.onBack : null,
+                            key: const Key('panel-reply'),
+                            label: '回复',
+                            onPressed: isThread ? widget.onStartReply : null,
                           ),
-                          _ClassicButton(label: '首页', onPressed: widget.onHome),
                           _ClassicButton(
                             key: const Key('bookmark-current'),
                             label:
@@ -152,21 +195,26 @@ class _ReaderSidePanelState extends State<ReaderSidePanel> {
                                     : null,
                           ),
                           _ClassicButton(
+                            key: const Key('panel-jump-floor'),
+                            label: '跳楼层',
+                            onPressed: isThread ? widget.onJumpToFloor : null,
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 5),
+                      _ButtonRow(
+                        children: [
+                          _ClassicButton(
                             label: '登录',
                             onPressed: () => _toggle(_PanelForm.login),
                           ),
-                          if (isThread)
-                            _ClassicButton(
-                              label: '回复',
-                              onPressed: widget.onStartReply,
-                            ),
                           _ClassicButton(
                             label: '新建帖子',
                             onPressed: widget.onStartNewThread,
                           ),
                           _ClassicButton(
                             key: const Key('clear-thread-cache'),
-                            label: '清除帖子缓存',
+                            label: '清除缓存',
                             onPressed: widget.busy ? null : _confirmClearCache,
                           ),
                         ],
@@ -245,45 +293,59 @@ class _ReaderSidePanelState extends State<ReaderSidePanel> {
         final active = widget.document?.threadId == marker.threadId;
         return Padding(
           padding: const EdgeInsets.only(bottom: 4),
-          child: Material(
-            color: active ? const Color(0xffddffdd) : const Color(0xffefefef),
-            child: InkWell(
-              key: ValueKey('thread-tab-${marker.threadId}'),
-              onTap: () => widget.onOpenThread(marker),
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 6),
-                decoration: BoxDecoration(
-                  border: Border.all(
-                    color: active ? const Color(0xff006600) : Colors.black,
-                  ),
-                ),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        marker.threadTitle,
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontFamily: 'Saitamaar',
-                          fontSize: 14,
-                          height: 1.1,
-                          color: Color(0xff0000ee),
-                          decoration: TextDecoration.underline,
+          child: Container(
+            decoration: BoxDecoration(
+              color: active ? const Color(0xffddffdd) : const Color(0xffefefef),
+              border: Border.all(
+                color: active ? const Color(0xff006600) : Colors.black,
+              ),
+            ),
+            child: Material(
+              color: Colors.transparent,
+              child: Row(
+                children: [
+                  Expanded(
+                    child: InkWell(
+                      key: ValueKey('thread-tab-${marker.threadId}'),
+                      onTap: () => widget.onOpenThread(marker),
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(7, 6, 4, 6),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: _PanelLink(
+                                label: marker.threadTitle,
+                                maxLines: 2,
+                              ),
+                            ),
+                            const SizedBox(width: 6),
+                            Text(
+                              '#${marker.floor}',
+                              style: const TextStyle(
+                                fontFamily: 'Saitamaar',
+                                fontSize: 13,
+                                height: 1,
+                              ),
+                            ),
+                          ],
                         ),
                       ),
                     ),
-                    const SizedBox(width: 6),
-                    Text(
-                      '#${marker.floor}',
-                      style: const TextStyle(
-                        fontFamily: 'Saitamaar',
-                        fontSize: 13,
-                        height: 1,
-                      ),
+                  ),
+                  IconButton(
+                    key: ValueKey('thread-tab-close-${marker.threadId}'),
+                    tooltip: '关闭标签页',
+                    visualDensity: VisualDensity.compact,
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(
+                      minWidth: 32,
+                      minHeight: 32,
                     ),
-                  ],
-                ),
+                    iconSize: 16,
+                    onPressed: () => widget.onRemoveThread(marker.threadId),
+                    icon: const Icon(Icons.close),
+                  ),
+                ],
               ),
             ),
           ),
@@ -320,17 +382,10 @@ class _ReaderSidePanelState extends State<ReaderSidePanel> {
                 onTap: () => widget.onOpenBookmark(bookmark),
                 child: Padding(
                   padding: const EdgeInsets.symmetric(vertical: 7),
-                  child: Text(
-                    '${bookmark.threadTitle}\n#${bookmark.floor}',
+                  child: _PanelLink(
+                    label: '${bookmark.threadTitle}\n#${bookmark.floor}',
                     maxLines: 3,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(
-                      fontFamily: 'Saitamaar',
-                      fontSize: 14,
-                      height: 1.15,
-                      color: Color(0xff0000ee),
-                      decoration: TextDecoration.underline,
-                    ),
+                    lineHeight: 1.15,
                   ),
                 ),
               ),
@@ -434,6 +489,75 @@ class _ReaderSidePanelState extends State<ReaderSidePanel> {
   }
 }
 
+/// A panel link drawn with the same straight underline the board pages use, so
+/// the rule stays put when Saitamaar falls back for an unsupported glyph.
+class _PanelLink extends StatelessWidget {
+  const _PanelLink({
+    required this.label,
+    required this.maxLines,
+    this.lineHeight = 1.1,
+  });
+
+  static const _fontSize = 14.0;
+
+  final String label;
+  final int maxLines;
+  final double lineHeight;
+
+  @override
+  Widget build(BuildContext context) {
+    final style = TextStyle(
+      fontFamily: 'Saitamaar',
+      fontSize: _fontSize,
+      height: lineHeight,
+      color: const Color(0xff0000ee),
+      decoration: TextDecoration.none,
+    );
+    final span = TextSpan(text: label, style: style);
+    return CustomPaint(
+      foregroundPainter: AlignedUnderlinePainter(
+        text: span,
+        ranges: [
+          AlignedUnderlineRange(
+            start: 0,
+            end: label.length,
+            color: const Color(0xff0000ee),
+          ),
+        ],
+        textDirection: Directionality.of(context),
+        textScaler: MediaQuery.textScalerOf(context),
+        locale: Localizations.maybeLocaleOf(context),
+        maxLines: maxLines,
+        ellipsis: '…',
+      ),
+      child: Text(
+        label,
+        maxLines: maxLines,
+        overflow: TextOverflow.ellipsis,
+        style: style,
+      ),
+    );
+  }
+}
+
+class _ButtonRow extends StatelessWidget {
+  const _ButtonRow({required this.children});
+
+  final List<Widget> children;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        for (var index = 0; index < children.length; index++) ...[
+          if (index > 0) const SizedBox(width: 5),
+          Expanded(child: children[index]),
+        ],
+      ],
+    );
+  }
+}
+
 class _PanelSectionTitle extends StatelessWidget {
   const _PanelSectionTitle({required this.label});
 
@@ -513,7 +637,7 @@ class _ClassicButton extends StatelessWidget {
         foregroundColor: Colors.black,
         backgroundColor: const Color(0xffefefef),
         disabledForegroundColor: const Color(0xff999999),
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 7),
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 7),
         minimumSize: const Size(0, 30),
         side: const BorderSide(color: Colors.black),
         shape: const RoundedRectangleBorder(),
@@ -523,7 +647,7 @@ class _ClassicButton extends StatelessWidget {
           height: 1,
         ),
       ),
-      child: Text(label),
+      child: FittedBox(fit: BoxFit.scaleDown, child: Text(label)),
     );
   }
 }

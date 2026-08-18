@@ -3,7 +3,9 @@ import 'dart:convert';
 import 'package:aafanclub_viewer/app.dart';
 import 'package:aafanclub_viewer/data/forum_repository.dart';
 import 'package:aafanclub_viewer/domain/forum_document.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:scrollable_positioned_list/scrollable_positioned_list.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -117,6 +119,21 @@ class _FakeRepository extends ForumRepository {
     loginTrip = trip;
     return current;
   }
+}
+
+/// Delivers the Android system back key the same way the engine does.
+Future<void> pressSystemBack(WidgetTester tester) {
+  return tester.binding.defaultBinaryMessenger.handlePlatformMessage(
+    'flutter/navigation',
+    const JSONMethodCodec().encodeMethodCall(const MethodCall('popRoute')),
+    (_) {},
+  );
+}
+
+Future<void> openReaderPanel(WidgetTester tester) async {
+  final edgeRect = tester.getRect(find.byKey(const Key('edge-tap-surface')));
+  await tester.tapAt(Offset(edgeRect.right - 20, edgeRect.center.dy));
+  await tester.pumpAndSettle();
 }
 
 void main() {
@@ -370,5 +387,271 @@ void main() {
       Uri.parse('http://aafanclub.com/view/1-2'),
     );
     expect(find.text('第 75 楼'), findsOneWidget);
+  });
+
+  testWidgets('the system back key closes the panel, then walks history', (
+    tester,
+  ) async {
+    final repository = _FakeRepository();
+    await tester.pumpWidget(AaFanclubApp(repository: repository));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('测试帖子').first);
+    await tester.pumpAndSettle();
+    expect(find.textContaining('第一楼'), findsOneWidget);
+
+    await openReaderPanel(tester);
+    await pressSystemBack(tester);
+    await tester.pumpAndSettle();
+    expect(
+      tester.getTopLeft(find.byKey(const Key('reader-side-panel'))).dx,
+      greaterThanOrEqualTo(800),
+    );
+    expect(find.textContaining('第一楼'), findsOneWidget);
+
+    await pressSystemBack(tester);
+    await tester.pumpAndSettle();
+    expect(repository.requestedUris.last, Uri.parse('http://aafanclub.com/'));
+    expect(find.text('■帖子一览■'), findsOneWidget);
+
+    await pressSystemBack(tester);
+    await tester.pump();
+    expect(find.text('再按一次返回键退出'), findsOneWidget);
+  });
+
+  testWidgets('the side panel pages through a thread', (tester) async {
+    final repository = _FakeRepository();
+    await tester.pumpWidget(AaFanclubApp(repository: repository));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('测试帖子').first);
+    await tester.pumpAndSettle();
+    await openReaderPanel(tester);
+
+    expect(find.text('第 1 / 2 页'), findsOneWidget);
+    expect(
+      tester
+          .widget<OutlinedButton>(
+            find.descendant(
+              of: find.byKey(const Key('panel-previous-page')),
+              matching: find.byType(OutlinedButton),
+            ),
+          )
+          .onPressed,
+      isNull,
+    );
+
+    await tester.tap(find.byKey(const Key('panel-next-page')));
+    await tester.pumpAndSettle();
+
+    expect(
+      repository.requestedUris.last,
+      Uri.parse('http://aafanclub.com/view/1-2'),
+    );
+    expect(find.text('第 51 楼'), findsOneWidget);
+  });
+
+  testWidgets('jumping to a floor opens the page holding it', (tester) async {
+    final repository = _FakeRepository();
+    await tester.pumpWidget(AaFanclubApp(repository: repository));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('测试帖子').first);
+    await tester.pumpAndSettle();
+    await openReaderPanel(tester);
+    await tester.tap(find.byKey(const Key('panel-jump-floor')));
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const Key('jump-to-floor-dialog')), findsOneWidget);
+    await tester.enterText(find.byKey(const Key('jump-to-floor-input')), '75');
+    await tester.tap(find.byKey(const Key('jump-to-floor-confirm')));
+    await tester.pumpAndSettle();
+
+    expect(
+      repository.requestedUris.last,
+      Uri.parse('http://aafanclub.com/view/1-2'),
+    );
+    expect(find.text('第 75 楼'), findsOneWidget);
+  });
+
+  testWidgets('desktop shows a toolbar and drops the invisible edges', (
+    tester,
+  ) async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.windows;
+    final repository = _FakeRepository();
+    await tester.pumpWidget(AaFanclubApp(repository: repository));
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const Key('desktop-toolbar')), findsOneWidget);
+    expect(find.byKey(const Key('toolbar-page-indicator')), findsOneWidget);
+
+    // The left edge no longer reloads now that the toolbar owns that job.
+    final edgeRect = tester.getRect(find.byKey(const Key('edge-tap-surface')));
+    await tester.tapAt(Offset(edgeRect.left + 20, edgeRect.center.dy));
+    await tester.pump();
+    expect(repository.refreshCalls, 0);
+
+    await tester.tap(find.byKey(const Key('toolbar-reload')));
+    await tester.pump();
+    expect(repository.refreshCalls, 1);
+
+    await tester.tap(find.byKey(const Key('toolbar-panel')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('display-scale-slider')), findsOneWidget);
+
+    debugDefaultTargetPlatformOverride = null;
+  });
+
+  testWidgets('a thread tab can be closed from the panel', (
+    tester,
+  ) async {
+    final repository = _FakeRepository();
+    await tester.pumpWidget(AaFanclubApp(repository: repository));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('测试帖子').first);
+    await tester.pumpAndSettle();
+    await openReaderPanel(tester);
+    expect(find.byKey(const ValueKey('thread-tab-1')), findsOneWidget);
+    expect(find.text('#1'), findsOneWidget);
+
+    await tester.tap(find.byKey(const ValueKey('thread-tab-close-1')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('thread-tab-1')), findsNothing);
+    expect(find.text('还没有打开过帖子'), findsOneWidget);
+  });
+
+  testWidgets('double tapping reveals the edge zones until the next action', (
+    tester,
+  ) async {
+    final repository = _FakeRepository();
+    await tester.pumpWidget(AaFanclubApp(repository: repository));
+    await tester.pumpAndSettle();
+
+    final edge = find.byKey(const Key('edge-tap-surface'));
+    final middle = tester.getRect(edge).center;
+    expect(find.byKey(const Key('edge-hint-left')), findsNothing);
+
+    await tester.tapAt(middle);
+    await tester.pump(const Duration(milliseconds: 60));
+    await tester.tapAt(middle);
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const Key('edge-hint-left')), findsOneWidget);
+    expect(find.byKey(const Key('edge-hint-right')), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.byKey(const Key('edge-hint-left')),
+        matching: find.text('刷新'),
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(
+        of: find.byKey(const Key('edge-hint-right')),
+        matching: find.text('阅读工具'),
+      ),
+      findsOneWidget,
+    );
+
+    // The hint never swallows a tap: the zone underneath still refreshes.
+    final edgeRect = tester.getRect(edge);
+    await tester.tapAt(Offset(edgeRect.left + 20, edgeRect.center.dy));
+    await tester.pumpAndSettle();
+    expect(repository.refreshCalls, 1);
+    expect(find.byKey(const Key('edge-hint-left')), findsNothing);
+
+    // A double tap on post text beats the SelectionArea's word selection.
+    await tester.tap(find.text('测试帖子').first);
+    await tester.pumpAndSettle();
+    final body = tester.getCenter(find.byKey(const Key('post-body-1')));
+    await tester.tapAt(body);
+    await tester.pump(const Duration(milliseconds: 60));
+    await tester.tapAt(body);
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('edge-hint-left')), findsOneWidget);
+
+    // Long press still belongs to the text, so copying keeps working.
+    await tester.longPressAt(body);
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('edge-hint-left')), findsNothing);
+
+    await tester.tap(find.text('■回到首页■').first);
+    await tester.pumpAndSettle();
+
+    // Two slow taps are not a double tap.
+    await tester.tapAt(middle);
+    await tester.pump(const Duration(milliseconds: 700));
+    await tester.tapAt(middle);
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('edge-hint-left')), findsNothing);
+  });
+
+  testWidgets('a shown edge zone can be moved, resized and reset', (
+    tester,
+  ) async {
+    final repository = _FakeRepository();
+    await tester.pumpWidget(AaFanclubApp(repository: repository));
+    await tester.pumpAndSettle();
+
+    final middle = tester.getRect(find.byKey(const Key('edge-tap-surface')));
+    await tester.tapAt(middle.center);
+    await tester.pump(const Duration(milliseconds: 60));
+    await tester.tapAt(middle.center);
+    await tester.pumpAndSettle();
+
+    final zone = find.byKey(const Key('edge-hint-left'));
+    expect(zone, findsOneWidget);
+    final before = tester.getRect(zone);
+    // Nothing has been adjusted yet, so there is nothing to reset.
+    expect(find.byKey(const Key('edge-reset-left')), findsNothing);
+
+    await tester.drag(zone, const Offset(0, 90));
+    await tester.pumpAndSettle();
+    final moved = tester.getRect(zone);
+    expect(moved.top, greaterThan(before.top));
+    expect(moved.size, before.size);
+    expect(find.byKey(const Key('edge-reset-left')), findsOneWidget);
+
+    await tester.drag(
+      find.byKey(const Key('edge-resize-left')),
+      const Offset(30, 40),
+    );
+    await tester.pumpAndSettle();
+    final resized = tester.getRect(zone);
+    expect(resized.width, greaterThan(moved.width));
+    expect(resized.height, greaterThan(moved.height));
+
+    await tester.tap(find.byKey(const Key('edge-reset-left')));
+    await tester.pumpAndSettle();
+    expect(tester.getRect(zone), before);
+    expect(find.byKey(const Key('edge-reset-left')), findsNothing);
+    // The right zone was never touched, so it keeps its own default.
+    expect(find.byKey(const Key('edge-reset-right')), findsNothing);
+  });
+
+  testWidgets('links turn red while held and take taps beyond the glyphs', (
+    tester,
+  ) async {
+    final repository = _FakeRepository();
+    await tester.pumpWidget(AaFanclubApp(repository: repository));
+    await tester.pumpAndSettle();
+
+    final title = find.text('测试帖子').first;
+    Color? titleColor() => tester.widget<Text>(title).style?.color;
+    expect(titleColor(), const Color(0xff0000ff));
+
+    // Press in the slack just below the glyphs, past the tap deadline.
+    final glyphs = tester.getRect(title);
+    final gesture = await tester.startGesture(
+      Offset(glyphs.left + 4, glyphs.bottom + 4),
+    );
+    await tester.pump(const Duration(milliseconds: 200));
+    expect(titleColor(), const Color(0xffff0000));
+
+    // Releasing there still opens the thread, so the slack really is tappable.
+    await gesture.up();
+    await tester.pumpAndSettle();
+    expect(repository.requestedUris.last.path, startsWith('/view/1'));
   });
 }

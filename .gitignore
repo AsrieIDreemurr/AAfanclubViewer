@@ -13,6 +13,28 @@
 *.iws
 .idea/
 
+# Visual Studio / VS Code local workspace state. Created by building the
+# Windows target; holds local paths, the IntelliSense database and which
+# files were open — never anything the repository needs.
+.vs/
+*.sln
+*.slnx
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+.vscode/
+
+# Local machine configuration that embeds absolute paths
+local.properties
+android/local.properties
+key.properties
+*.jks
+*.keystore
+*.p12
+*.pem
+.env
+.env.*
+
 # Flutter/Dart/Pub related
 **/doc/api/
 .dart_tool/

@@ -4,6 +4,28 @@ import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
 
 void main() {
+  test('posted text uses CRLF line breaks like a browser form', () async {
+    String? postedBody;
+    final client = MockClient((request) async {
+      postedBody = request.body;
+      return http.Response(
+        '<html>ok</html>',
+        200,
+        headers: const {'content-type': 'text/html; charset=utf-8'},
+        request: request,
+      );
+    });
+    final source = NetworkPageSource(client: client);
+
+    await source.submitForm(Uri.parse('http://aafanclub.com/post/1'), {
+      'CONTENT': 'first\nsecond\r\nthird\rfourth',
+    });
+
+    // The board counts CRLF-separated lines to fold long homepage previews,
+    // so every break has to arrive percent-encoded as %0D%0A.
+    expect(postedBody, 'CONTENT=first%0D%0Asecond%0D%0Athird%0D%0Afourth');
+  });
+
   test('form submission keeps cookies and follows redirect as GET', () async {
     final requests = <http.Request>[];
     final client = MockClient((request) async {

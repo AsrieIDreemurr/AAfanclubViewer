@@ -159,22 +159,83 @@ class AaSavedPage {
   }
 }
 
+/// A bookmarked directory in the AA source tree. Only the path is kept; the
+/// folder's children are re-read from the live tree on the next visit.
+class AaSavedFolder {
+  const AaSavedFolder({
+    required this.hash,
+    required this.name,
+    required this.directory,
+    required this.savedAt,
+  });
+
+  final String hash;
+  final String name;
+  final String directory;
+  final DateTime savedAt;
+
+  String get id => hash;
+  String get fullPath => directory.isEmpty ? '/$name' : '$directory/$name';
+
+  factory AaSavedFolder.fromSource(AaSourceNode folder) {
+    return AaSavedFolder(
+      hash: folder.hash,
+      name: folder.filename,
+      directory: folder.directory,
+      savedAt: DateTime.now(),
+    );
+  }
+
+  Map<String, Object> toJson() => {
+    'hash': hash,
+    'name': name,
+    'directory': directory,
+    'savedAt': savedAt.toIso8601String(),
+  };
+
+  static AaSavedFolder? fromJson(Object? value) {
+    if (value is! Map) return null;
+    final hash = value['hash'];
+    final name = value['name'];
+    final directory = value['directory'];
+    final savedAt = value['savedAt'];
+    if (hash is! String ||
+        name is! String ||
+        directory is! String ||
+        savedAt is! String) {
+      return null;
+    }
+    final time = DateTime.tryParse(savedAt);
+    if (time == null) return null;
+    return AaSavedFolder(
+      hash: hash,
+      name: name,
+      directory: directory,
+      savedAt: time,
+    );
+  }
+}
+
 class AaLibraryStore extends ChangeNotifier {
   static const _favoritesKey = 'aa.library.favorites.v1';
   static const _legacyAaHistoryKey = 'aa.library.history.v1';
   static const _favoritePagesKey = 'aa.library.favorite-pages.v1';
   static const _pageHistoryKey = 'aa.library.page-history.v1';
+  static const _favoriteFoldersKey = 'aa.library.favorite-folders.v1';
 
   SharedPreferences? _preferences;
   final List<AaSavedItem> _favoriteAas = [];
   final List<AaSavedPage> _favoritePages = [];
   final List<AaSavedPage> _pageHistory = [];
+  final List<AaSavedFolder> _favoriteFolders = [];
   bool _loaded = false;
 
   bool get loaded => _loaded;
   List<AaSavedItem> get favoriteAas => List.unmodifiable(_favoriteAas);
   List<AaSavedPage> get favoritePages => List.unmodifiable(_favoritePages);
   List<AaSavedPage> get pageHistory => List.unmodifiable(_pageHistory);
+  List<AaSavedFolder> get favoriteFolders =>
+      List.unmodifiable(_favoriteFolders);
 
   List<AaSavedPage> get favoritePageGroups {
     final pages = <String, AaSavedPage>{};
@@ -197,6 +258,10 @@ class AaLibraryStore extends ChangeNotifier {
       _decodeAaList(preferences.getString(_favoritesKey), _favoriteAas);
       _decodePageList(preferences.getString(_favoritePagesKey), _favoritePages);
       _decodePageList(preferences.getString(_pageHistoryKey), _pageHistory);
+      _decodeFolderList(
+        preferences.getString(_favoriteFoldersKey),
+        _favoriteFolders,
+      );
       if (_pageHistory.isEmpty) {
         final legacyHistory = <AaSavedItem>[];
         _decodeAaList(
@@ -256,6 +321,23 @@ class AaLibraryStore extends ChangeNotifier {
     _savePages(_favoritePagesKey, _favoritePages);
   }
 
+  bool isFolderFavorite(String hash) {
+    return _favoriteFolders.any((folder) => folder.hash == hash);
+  }
+
+  void toggleFolderFavorite(AaSavedFolder folder) {
+    final index = _favoriteFolders.indexWhere(
+      (saved) => saved.hash == folder.hash,
+    );
+    if (index >= 0) {
+      _favoriteFolders.removeAt(index);
+    } else {
+      _favoriteFolders.insert(0, folder);
+    }
+    notifyListeners();
+    _saveFolders();
+  }
+
   void addPageHistory(AaSavedPage page) {
     _pageHistory.removeWhere((saved) => saved.fileHash == page.fileHash);
     _pageHistory.insert(0, page);
@@ -264,12 +346,18 @@ class AaLibraryStore extends ChangeNotifier {
   }
 
   void clearFavorites() {
-    if (_favoriteAas.isEmpty && _favoritePages.isEmpty) return;
+    if (_favoriteAas.isEmpty &&
+        _favoritePages.isEmpty &&
+        _favoriteFolders.isEmpty) {
+      return;
+    }
     _favoriteAas.clear();
     _favoritePages.clear();
+    _favoriteFolders.clear();
     notifyListeners();
     _saveAas(_favoritesKey, _favoriteAas);
     _savePages(_favoritePagesKey, _favoritePages);
+    _saveFolders();
   }
 
   void clearHistory() {
@@ -287,6 +375,27 @@ class AaLibraryStore extends ChangeNotifier {
       final item = AaSavedItem.fromJson(value);
       if (item != null) target.add(item);
     }
+  }
+
+  void _decodeFolderList(String? source, List<AaSavedFolder> target) {
+    if (source == null) return;
+    final decoded = jsonDecode(source);
+    if (decoded is! List) return;
+    for (final value in decoded) {
+      final folder = AaSavedFolder.fromJson(value);
+      if (folder != null) target.add(folder);
+    }
+  }
+
+  void _saveFolders() {
+    final preferences = _preferences;
+    if (preferences == null) return;
+    unawaited(
+      preferences.setString(
+        _favoriteFoldersKey,
+        jsonEncode(_favoriteFolders.map((item) => item.toJson()).toList()),
+      ),
+    );
   }
 
   void _decodePageList(String? source, List<AaSavedPage> target) {

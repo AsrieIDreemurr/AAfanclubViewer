@@ -25,6 +25,8 @@ class AlignedUnderlinePainter extends CustomPainter {
     required this.textScaler,
     this.strutStyle,
     this.locale,
+    this.maxLines,
+    this.ellipsis,
   });
 
   final InlineSpan text;
@@ -33,6 +35,11 @@ class AlignedUnderlinePainter extends CustomPainter {
   final TextScaler textScaler;
   final StrutStyle? strutStyle;
   final Locale? locale;
+
+  /// Must match the painted [Text] so the boxes line up with the glyphs the
+  /// reader actually sees.
+  final int? maxLines;
+  final String? ellipsis;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -43,6 +50,8 @@ class AlignedUnderlinePainter extends CustomPainter {
       textScaler: textScaler,
       strutStyle: strutStyle,
       locale: locale,
+      maxLines: maxLines,
+      ellipsis: ellipsis,
     )..layout(maxWidth: size.width);
     final lines = painter.computeLineMetrics();
     if (lines.isEmpty) return;
@@ -77,6 +86,8 @@ class AlignedUnderlinePainter extends CustomPainter {
         oldDelegate.textDirection != textDirection ||
         oldDelegate.textScaler != textScaler ||
         oldDelegate.strutStyle != strutStyle ||
-        oldDelegate.locale != locale;
+        oldDelegate.locale != locale ||
+        oldDelegate.maxLines != maxLines ||
+        oldDelegate.ellipsis != ellipsis;
   }
 }

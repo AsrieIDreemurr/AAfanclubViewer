@@ -22,88 +22,131 @@ class ComposerTextLayer {
   final int column;
 }
 
+/// Measures the rendered width of a run of text in the forum's own font.
+typedef ComposerGlyphWidth = double Function(String text);
+
 /// Flattens bottom-to-top text layers into the exact plain text sent to the
 /// forum. Whitespace advances the cursor but never erases a lower layer.
-String composeTextLayers(Iterable<ComposerTextLayer> layers) {
-  final rows = <int, Map<int, _PlacedGlyph>>{};
+///
+/// [measureWidth] and [spaceWidth] make padding follow the real font: the
+/// board renders in a proportional face, so a run of glyphs is not as wide as
+/// the same number of spaces. Without them the function falls back to treating
+/// every half-width cell as one space, which is only exact for a monospace
+/// target. Glyphs placed before the origin are dropped, never shifted, so what
+/// stays inside the frame keeps the columns the author gave it.
+String composeTextLayers(
+  Iterable<ComposerTextLayer> layers, {
+  ComposerGlyphWidth? measureWidth,
+  double spaceWidth = 1,
+}) {
+  final rows = <int, List<_PlacedGlyph>>{};
+  final widthCache = <String, double>{};
+
+  /// How far the caret moves past [glyph]. Saitamaar is proportional, so this
+  /// is nothing like the East Asian cell count: `A` is two space-widths, `i`
+  /// is a little over half of one, and the ideographic space is 2.2.
+  double advanceOf(String glyph, int rune) {
+    final measure = measureWidth;
+    if (measure == null) {
+      return math.max(1, _characterWidth(rune)) * spaceWidth;
+    }
+    return widthCache.putIfAbsent(glyph, () => measure(glyph));
+  }
 
   for (final layer in layers) {
-    var row = math.max(0, layer.row);
-    final startColumn = math.max(0, layer.column);
-    var column = startColumn;
+    var row = layer.row;
+    final startX = layer.column * spaceWidth;
+    var x = startX;
+    _PlacedGlyph? previous;
 
     for (final rune in layer.text.runes) {
       if (rune == 0x0d) continue;
       if (rune == 0x0a) {
         row++;
-        column = startColumn;
+        x = startX;
+        previous = null;
         continue;
       }
       if (rune == 0x09) {
-        column = ((column ~/ 4) + 1) * 4;
+        final stop = spaceWidth * 4;
+        x = ((x / stop).floor() + 1) * stop;
+        previous = null;
         continue;
       }
 
-      var width = _characterWidth(rune);
-      if (_isTransparentWhitespace(rune)) {
-        column += math.max(1, width);
-        continue;
-      }
-
-      final rowCells = rows.putIfAbsent(row, () => <int, _PlacedGlyph>{});
       final glyph = String.fromCharCode(rune);
-      if (width == 0) {
-        final previous = rowCells[column - 1];
-        if (previous != null) {
-          previous.text += glyph;
-          continue;
-        }
-        width = 1;
+      if (_isTransparentWhitespace(rune)) {
+        x += advanceOf(glyph, rune);
+        previous = null;
+        continue;
       }
 
-      final replaced = <_PlacedGlyph>{};
-      for (var cell = column; cell < column + width; cell++) {
-        final existing = rowCells[cell];
-        if (existing != null) replaced.add(existing);
+      final cells = _characterWidth(rune);
+      if (cells == 0 && previous != null) {
+        previous.text += glyph;
+        continue;
       }
-      for (final existing in replaced) {
-        rowCells.removeWhere((_, value) => identical(value, existing));
+      // A combining mark with nothing to attach to still needs to occupy a
+      // cell of its own, the way the old cell engine promoted it to width 1.
+      final advance = math.max(
+        advanceOf(glyph, rune),
+        cells == 0 ? spaceWidth : 0.0,
+      );
+
+      // Anything before the origin is dropped rather than shifted, so what
+      // stays in frame keeps the position the author gave it.
+      if (row < 0 || x < -0.01) {
+        x += advance;
+        previous = null;
+        continue;
       }
 
-      final placed = _PlacedGlyph(text: glyph, column: column, width: width);
-      for (var cell = column; cell < column + width; cell++) {
-        rowCells[cell] = placed;
-      }
-      column += width;
+      final placed = _PlacedGlyph(text: glyph, x: x, advance: advance);
+      _placeGlyph(rows.putIfAbsent(row, () => <_PlacedGlyph>[]), placed);
+      previous = placed;
+      x += advance;
     }
   }
 
   final visibleRows = rows.entries.where((entry) => entry.value.isNotEmpty);
   if (visibleRows.isEmpty) return '';
   final lastRow = visibleRows.map((entry) => entry.key).reduce(math.max);
+
   final output = StringBuffer();
   for (var row = 0; row <= lastRow; row++) {
     if (row > 0) output.write('\n');
-    final cells = rows[row];
-    if (cells == null || cells.isEmpty) continue;
-    final lastColumn = cells.keys.reduce(math.max);
+    final glyphs = rows[row];
+    if (glyphs == null || glyphs.isEmpty) continue;
     final line = StringBuffer();
-    var column = 0;
-    while (column <= lastColumn) {
-      final placed = cells[column];
-      if (placed == null) {
+    var lineWidth = 0.0;
+    for (final glyph in glyphs) {
+      // Pad until the glyph lands on its own pixel column, rounding to the
+      // nearest whole space since that is the only ruler plain text has.
+      while (glyph.x - lineWidth >= spaceWidth / 2) {
         line.write(' ');
-        column++;
-      } else if (placed.column == column) {
-        line.write(placed.text);
-        column += placed.width;
-      } else {
-        column++;
+        lineWidth += spaceWidth;
       }
+      line.write(glyph.text);
+      lineWidth += glyph.advance;
     }
     output.write(line.toString().replaceFirst(RegExp(r' +$'), ''));
   }
   return output.toString().replaceFirst(RegExp(r'\n+$'), '');
+}
+
+/// Inserts [glyph] in x order, erasing whatever it lands on top of.
+void _placeGlyph(List<_PlacedGlyph> row, _PlacedGlyph glyph) {
+  const epsilon = 0.01;
+  row.removeWhere(
+    (existing) =>
+        existing.x < glyph.end - epsilon && glyph.x < existing.end - epsilon,
+  );
+  final index = row.indexWhere((existing) => existing.x > glyph.x);
+  if (index < 0) {
+    row.add(glyph);
+  } else {
+    row.insert(index, glyph);
+  }
 }
 
 class PostComposerSheet extends StatefulWidget {
@@ -129,12 +172,20 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
   static const _previewTextLeft = 6.0;
   static const _previewTextTop = 6.0;
 
+  /// Cells of hatched gutter kept before the origin, so a window can be
+  /// dragged past the start of the post while staying inside the canvas.
+  static const _gutterColumns = 24;
+  static const _gutterRows = 5;
+
   final _title = TextEditingController();
+  final _previewController = TextEditingController();
   final List<_EditorLayer> _layers = [];
   int _nextLayerId = 0;
   String? _preview;
   bool _sending = false;
   bool _layerPanelOpen = false;
+  bool _canvasParked = false;
+  final TransformationController _canvasTransform = TransformationController();
   Size _canvasSize = const Size(320, 360);
   Size _viewportSize = const Size(320, 360);
   double _columnWidth = 5;
@@ -145,9 +196,11 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
   @override
   void dispose() {
     _title.dispose();
+    _previewController.dispose();
     for (final layer in _layers) {
       layer.dispose();
     }
+    _canvasTransform.dispose();
     super.dispose();
   }
 
@@ -259,7 +312,7 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
               key: const Key('composer-cancel-preview'),
               label: '取消',
               onPressed:
-                  _sending ? null : () => setState(() => _preview = null),
+                  _sending ? null : _cancelPreview,
             ),
             const SizedBox(width: 5),
           ],
@@ -279,27 +332,13 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
   }
 
   Widget _buildCanvas() {
-    if (_preview != null) {
-      return Container(
-        key: const Key('composer-preview'),
-        alignment: Alignment.topLeft,
-        color: const Color(0xffefefef),
-        padding: const EdgeInsets.fromLTRB(
-          _previewTextLeft,
-          _previewTextTop - 1,
-          6,
-          5,
-        ),
-        child: SingleChildScrollView(
-          child: AaText(_preview!, key: const Key('composer-preview-text')),
-        ),
-      );
-    }
+    if (_preview != null) return _buildPreviewEditor();
 
     return LayoutBuilder(
       builder: (context, constraints) {
         _viewportSize = constraints.biggest;
         _canvasSize = _calculateWorkspaceSize(_viewportSize);
+        _parkCanvasOnOrigin();
         return ColoredBox(
           key: const Key('composer-canvas'),
           color: const Color(0xffefefef),
@@ -308,11 +347,12 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
               Positioned.fill(
                 child: InteractiveViewer(
                   key: const Key('composer-workspace-pan'),
+                  transformationController: _canvasTransform,
                   constrained: false,
-                  scaleEnabled: false,
+                  scaleEnabled: true,
                   panEnabled: true,
-                  minScale: 1,
-                  maxScale: 1,
+                  minScale: 0.35,
+                  maxScale: 4,
                   alignment: Alignment.topLeft,
                   boundaryMargin: EdgeInsets.all(
                     math.max(_viewportSize.width, _viewportSize.height),
@@ -320,8 +360,11 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
                   child: SizedBox(
                     width: _canvasSize.width,
                     height: _canvasSize.height,
-                    child: ColoredBox(
-                      color: const Color(0xffefefef),
+                    child: CustomPaint(
+                      painter: _OutOfFramePainter(
+                        originX: _originX,
+                        originY: _originY,
+                      ),
                       child: Stack(
                         children: [
                           for (final layer in _layers) _buildLayerWindow(layer),
@@ -335,7 +378,9 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
                 const IgnorePointer(
                   child: Center(
                     child: Text(
-                      '拖动空白区域可移动画布\n点击“嵌入文字”或“嵌入AA”添加窗口',
+                      '拖动空白区域可移动画布，双指缩放\n'
+                      '点击“嵌入文字”或“嵌入AA”添加窗口\n'
+                      '灰色斜线区域在正文之外，那里的文字不会发出去',
                       textAlign: TextAlign.center,
                       style: TextStyle(
                         fontFamily: 'Saitamaar',
@@ -350,6 +395,64 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
           ),
         );
       },
+    );
+  }
+
+  /// The confirmed post, editable as plain text. Edits made here are thrown
+  /// away by 取消 — they never turn back into windows.
+  Widget _buildPreviewEditor() {
+    return Container(
+      key: const Key('composer-preview'),
+      alignment: Alignment.topLeft,
+      color: const Color(0xffefefef),
+      child: LayoutBuilder(
+        builder: (context, constraints) {
+          // AA must not wrap, so the field is laid out at its widest line and
+          // the surplus is reached by scrolling sideways.
+          final longest = _preview!
+              .split('\n')
+              .map(_measureRun)
+              .fold(0.0, math.max);
+          final width = math.max(
+            constraints.maxWidth,
+            longest + _previewTextLeft + 24,
+          );
+          return SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: SizedBox(
+              width: width,
+              height: constraints.maxHeight,
+              child: Padding(
+                padding: const EdgeInsets.fromLTRB(
+                  _previewTextLeft,
+                  _previewTextTop - 1,
+                  6,
+                  5,
+                ),
+                child: TextField(
+                  key: const Key('composer-preview-text'),
+                  controller: _previewController,
+                  maxLines: null,
+                  expands: true,
+                  textAlignVertical: TextAlignVertical.top,
+                  keyboardType: TextInputType.multiline,
+                  style: AaText.baseStyle,
+                  strutStyle: const StrutStyle(
+                    fontFamily: 'Saitamaar',
+                    fontSize: 16,
+                    height: 1,
+                    forceStrutHeight: false,
+                  ),
+                  decoration: const InputDecoration(
+                    border: InputBorder.none,
+                    isCollapsed: true,
+                  ),
+                ),
+              ),
+            ),
+          );
+        },
+      ),
     );
   }
 
@@ -592,9 +695,21 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
     );
   }
 
+  /// Opens the canvas looking at the first character of the post, so the
+  /// hatched gutter sits off-screen until it is deliberately scrolled to.
+  void _parkCanvasOnOrigin() {
+    if (_canvasParked) return;
+    _canvasParked = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _canvasTransform.value =
+          Matrix4.identity()..translate(-_originX, -_originY);
+    });
+  }
+
   Size _calculateWorkspaceSize(Size viewport) {
-    var width = math.max(640.0, viewport.width * 2);
-    var height = math.max(720.0, viewport.height * 2);
+    var width = math.max(640.0, viewport.width * 2) + _originX;
+    var height = math.max(720.0, viewport.height * 2) + _originY;
     for (final layer in _layers) {
       final size = _layerSize(layer);
       width = math.max(width, layer.position.dx + size.width + viewport.width);
@@ -612,8 +727,8 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
     final layer = _EditorLayer(
       id: id,
       position: Offset(
-        _columnWidth * (3 + stagger * 4),
-        _rowHeight * (2 + stagger) - _verticalOriginDelta,
+        _canvasXForColumn(1 + stagger * 4),
+        _canvasYForRow(1 + stagger),
       ),
       text: initialText,
     );
@@ -670,18 +785,19 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
     final maxX = math.max(0.0, _canvasSize.width - size.width);
     final maxY = math.max(0.0, _canvasSize.height - size.height);
 
+    // Columns and rows may go negative: that is the out-of-frame gutter, and
+    // the canvas bounds are the only real limit.
     final minimumColumn =
-        ((_editorTextLeft - _previewTextLeft) / _columnWidth).ceil();
+        ((_editorTextLeft - _previewTextLeft - _originX) / _columnWidth).ceil();
     final maximumColumn =
-        ((maxX + _editorTextLeft - _previewTextLeft) / _columnWidth).floor();
-    final requestedColumn =
-        ((position.dx + _editorTextLeft - _previewTextLeft) / _columnWidth)
-            .round();
+        ((maxX + _editorTextLeft - _previewTextLeft - _originX) / _columnWidth)
+            .floor();
+    final requestedColumn = _columnForCanvasX(position.dx);
 
-    final minimumRow = (_verticalOriginDelta / _rowHeight).ceil();
-    final maximumRow = ((maxY + _verticalOriginDelta) / _rowHeight).floor();
-    final requestedRow =
-        ((position.dy + _verticalOriginDelta) / _rowHeight).round();
+    final minimumRow = ((_verticalOriginDelta - _originY) / _rowHeight).ceil();
+    final maximumRow =
+        ((maxY + _verticalOriginDelta - _originY) / _rowHeight).floor();
+    final requestedRow = _rowForCanvasY(position.dy);
 
     final column =
         maximumColumn >= minimumColumn
@@ -692,11 +808,8 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
             ? requestedRow.clamp(minimumRow, maximumRow)
             : minimumRow;
     return Offset(
-      (column * _columnWidth - _editorTextLeft + _previewTextLeft).clamp(
-        0,
-        maxX,
-      ),
-      (row * _rowHeight - _verticalOriginDelta).clamp(0, maxY),
+      _canvasXForColumn(column).clamp(0, maxX),
+      _canvasYForRow(row).clamp(0, maxY),
     );
   }
 
@@ -724,18 +837,28 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
     }
   }
 
+  void _cancelPreview() {
+    // Text typed straight into the preview is discarded rather than folded
+    // back into a window, so the canvas is exactly as it was left.
+    setState(() {
+      _preview = null;
+      _previewController.clear();
+    });
+  }
+
   void _showPreview() {
     final layers = _layers.map((layer) {
       return ComposerTextLayer(
         text: layer.controller.text,
-        row: ((layer.position.dy + _verticalOriginDelta) / _rowHeight).round(),
-        column:
-            ((layer.position.dx + _editorTextLeft - _previewTextLeft) /
-                    _columnWidth)
-                .round(),
+        row: _rowForCanvasY(layer.position.dy),
+        column: _columnForCanvasX(layer.position.dx),
       );
     });
-    final result = composeTextLayers(layers);
+    final result = composeTextLayers(
+      layers,
+      measureWidth: _measureRun,
+      spaceWidth: _columnWidth,
+    );
     if (result.trim().isEmpty) {
       _showMessage('请先嵌入文字内容');
       return;
@@ -748,13 +871,18 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
     FocusScope.of(context).unfocus();
     setState(() {
       _preview = result;
+      _previewController.text = result;
       _layerPanelOpen = false;
     });
   }
 
   Future<void> _send() async {
-    final content = _preview;
-    if (content == null || _sending) return;
+    if (_preview == null || _sending) return;
+    final content = _previewController.text;
+    if (content.trim().isEmpty) {
+      _showMessage('内容为空，无法发送');
+      return;
+    }
     setState(() => _sending = true);
     final success = await widget.onSubmit(
       widget.mode == ComposerMode.newThread ? _title.text.trim() : null,
@@ -776,6 +904,32 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
 
   double get _verticalOriginDelta =>
       _headerHeight + _editorTextTop - _previewTextTop;
+
+  /// Canvas offset of the post's first character. Everything left of or above
+  /// it is out of frame and gets dropped when the layers are flattened.
+  double get _originX => _columnWidth * _gutterColumns;
+  double get _originY => _rowHeight * _gutterRows;
+
+  double _canvasXForColumn(int column) =>
+      _originX + column * _columnWidth - _editorTextLeft + _previewTextLeft;
+  double _canvasYForRow(int row) =>
+      _originY + row * _rowHeight - _verticalOriginDelta;
+  int _columnForCanvasX(double x) =>
+      ((x - _originX + _editorTextLeft - _previewTextLeft) / _columnWidth)
+          .round();
+  int _rowForCanvasY(double y) =>
+      ((y - _originY + _verticalOriginDelta) / _rowHeight).round();
+
+  /// Width of a run of text in the board's font, used so padding lands on the
+  /// right pixel column instead of the right cell count.
+  double _measureRun(String text) {
+    final painter = TextPainter(
+      text: TextSpan(text: text, style: AaText.baseStyle),
+      textDirection: _textDirection,
+      textScaler: _textScaler,
+    )..layout();
+    return painter.width;
+  }
 
   void _updateTextMetrics(BuildContext context) {
     final scaler = MediaQuery.textScalerOf(context);
@@ -806,6 +960,61 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
   }
 }
 
+/// Shades everything before the origin. Text dragged into the hatching is
+/// outside the post: it is dropped when the layers are flattened, and the
+/// glyphs still inside keep the columns they were given.
+class _OutOfFramePainter extends CustomPainter {
+  const _OutOfFramePainter({required this.originX, required this.originY});
+
+  final double originX;
+  final double originY;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.drawRect(
+      Offset.zero & size,
+      Paint()..color = const Color(0xffefefef),
+    );
+    if (originX <= 0 && originY <= 0) return;
+
+    final outside =
+        Path()
+          ..addRect(Rect.fromLTWH(0, 0, originX, size.height))
+          ..addRect(Rect.fromLTWH(originX, 0, size.width - originX, originY));
+
+    canvas.save();
+    canvas.clipPath(outside);
+    canvas.drawRect(
+      Offset.zero & size,
+      Paint()..color = const Color(0x0f000000),
+    );
+    final stroke =
+        Paint()
+          ..color = const Color(0x38000000)
+          ..strokeWidth = 1;
+    const spacing = 9.0;
+    for (var x = -size.height; x < size.width; x += spacing) {
+      canvas.drawLine(
+        Offset(x, 0),
+        Offset(x + size.height, size.height),
+        stroke,
+      );
+    }
+    canvas.restore();
+
+    final rule =
+        Paint()
+          ..color = const Color(0x8c000000)
+          ..strokeWidth = 1;
+    canvas.drawLine(Offset(originX, 0), Offset(originX, size.height), rule);
+    canvas.drawLine(Offset(0, originY), Offset(size.width, originY), rule);
+  }
+
+  @override
+  bool shouldRepaint(covariant _OutOfFramePainter oldDelegate) =>
+      oldDelegate.originX != originX || oldDelegate.originY != originY;
+}
+
 class _EditorLayer {
   _EditorLayer({required this.id, required this.position, String text = ''})
     : controller = TextEditingController(text: text);
@@ -823,11 +1032,13 @@ class _EditorLayer {
 }
 
 class _PlacedGlyph {
-  _PlacedGlyph({required this.text, required this.column, required this.width});
+  _PlacedGlyph({required this.text, required this.x, required this.advance});
 
   String text;
-  final int column;
-  final int width;
+  final double x;
+  final double advance;
+
+  double get end => x + advance;
 }
 
 class _ComposerButton extends StatelessWidget {

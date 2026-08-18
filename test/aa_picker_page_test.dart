@@ -45,6 +45,121 @@ class _FakeAaLibraryClient extends AaLibraryClient {
 void main() {
   setUp(() => SharedPreferences.setMockInitialValues({}));
 
+  testWidgets('the path above a file walks back to its folders', (
+    tester,
+  ) async {
+    final store = AaLibraryStore();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: AaPickerPage(client: _FakeAaLibraryClient(), store: store),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('aa-node-folder-1')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('aa-node-file-1')));
+    await tester.pumpAndSettle();
+
+    // Viewing a file: the trail is AA目录 / あ行 / 作品.
+    expect(find.byKey(const Key('aa-crumb-current-file')), findsOneWidget);
+    final folderCrumb = find.byKey(const ValueKey('aa-crumb-folder-1'));
+    expect(folderCrumb, findsOneWidget);
+
+    await tester.tap(folderCrumb);
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('aa-node-file-1')), findsOneWidget);
+    expect(find.byKey(const Key('aa-crumb-current-file')), findsNothing);
+
+    await tester.tap(find.byKey(const Key('aa-crumb-root')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('aa-node-folder-1')), findsOneWidget);
+  });
+
+  testWidgets('the path works for a file opened without walking the tree', (
+    tester,
+  ) async {
+    final store = AaLibraryStore();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: AaPickerPage(client: _FakeAaLibraryClient(), store: store),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('aa-search-field')));
+    await tester.enterText(find.byKey(const Key('aa-search-field')), '作品');
+    await tester.pumpAndSettle();
+    await tester.tap(
+      find.descendant(
+        of: find.byKey(const Key('aa-search-results')),
+        matching: find.text('作品'),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    // Reached by search, so the folder stack was never built — the crumb has
+    // to come from the file's own directory string.
+    await tester.tap(find.byKey(const ValueKey('aa-crumb-folder-1')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('aa-node-file-1')), findsOneWidget);
+  });
+
+  testWidgets('folders can be favorited and reopened from the favorites view', (
+    tester,
+  ) async {
+    final store = AaLibraryStore();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: AaPickerPage(client: _FakeAaLibraryClient(), store: store),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byKey(const ValueKey('aa-folder-star-folder-1')));
+    await tester.pumpAndSettle();
+    expect(store.isFolderFavorite('folder-1'), isTrue);
+
+    tester
+        .state<ScaffoldState>(find.byKey(const Key('aa-picker-page')))
+        .openDrawer();
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const Key('aa-menu-favorites')));
+    await tester.pumpAndSettle();
+    final favorite = find.byKey(const ValueKey('aa-favorite-folder-folder-1'));
+    expect(favorite, findsOneWidget);
+
+    // Opening it walks back into the live tree, showing the folder's files.
+    await tester.tap(favorite);
+    await tester.pumpAndSettle();
+    expect(find.byKey(const ValueKey('aa-node-file-1')), findsOneWidget);
+  });
+
+  testWidgets('reopening the picker jumps straight to the last file', (
+    tester,
+  ) async {
+    final store = AaLibraryStore();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: AaPickerPage(client: _FakeAaLibraryClient(), store: store),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('aa-node-folder-1')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('aa-node-file-1')));
+    await tester.pumpAndSettle();
+    expect(store.pageHistory.first.fileHash, 'file-1');
+
+    // A fresh picker over the same store lands on that file, not the root.
+    await tester.pumpWidget(
+      MaterialApp(
+        home: AaPickerPage(client: _FakeAaLibraryClient(), store: store),
+      ),
+    );
+    await tester.pumpAndSettle();
+    expect(find.textContaining('作品'), findsWidgets);
+    expect(find.byKey(const ValueKey('aa-node-folder-1')), findsNothing);
+  });
+
   testWidgets('groups AA favorites by page and records page history', (
     tester,
   ) async {

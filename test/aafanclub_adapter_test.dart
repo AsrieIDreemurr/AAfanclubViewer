@@ -60,9 +60,14 @@ void main() {
     expect(result.threadId, '657');
     expect(result.currentPage, 1);
     expect(result.pageCount, 136);
+    expect(result.ownerFilter?.title, '■只看贴主■');
     expect(
-      result.ownerOnlyUri,
+      result.ownerFilter?.uri,
       Uri.parse('http://aafanclub.com/view/657-1-icchi'),
+    );
+    expect(
+      result.pagination.map((link) => link.pageNumber),
+      containsAll([1, 2, 136]),
     );
     expect(result.posts, hasLength(2));
     expect(result.posts.first.name, '◆作者');
@@ -80,6 +85,41 @@ void main() {
       ),
       isTrue,
     );
+  });
+
+  test('owner-only pages flip the filter link and keep their pagination', () {
+    // Shape copied from a live http://aafanclub.com/view/388-1-icchi response.
+    const source = '''
+      <html><head><title>只看贴主</title></head><body bgcolor="#EFEFEF">
+      <table><tr><td><a href="/">■回到首页■</a></td>
+        <td><a href="/view/388-1">■查看全部■</a></td>
+        <td>1</td><td><a href="/view/388-2-icchi">2</a></td>
+        <td><a href="/view/388-63-icchi">63</a></td></tr></table>
+      <h1>贴主专用</h1>
+        <dt id="f1">1 ： 贴主 ： 2026年08月17日 12:00:00 ID:ABCDEFGH</dt>
+        <dd>只有贴主的楼层</dd>
+      </body></html>
+    ''';
+
+    final result = adapter.parse(
+      source: source,
+      uri: Uri.parse('http://aafanclub.com/view/388-1-icchi'),
+      encoding: 'UTF-8',
+    );
+
+    expect(result.threadId, '388');
+    expect(result.ownerFilter?.title, '■查看全部■');
+    expect(
+      result.ownerFilter?.uri,
+      Uri.parse('http://aafanclub.com/view/388-1'),
+    );
+    // The ■查看全部■ target must not be mistaken for page one of this view.
+    expect(result.pagination.map((link) => link.pageNumber), [1, 2, 63]);
+    expect(
+      result.pagination.firstWhere((link) => link.pageNumber == 2).uri,
+      Uri.parse('http://aafanclub.com/view/388-2-icchi'),
+    );
+    expect(result.pageCount, 63);
   });
 
   test('parses homepage notices and preview posts', () {
