@@ -45,6 +45,7 @@ class _ViewerPageState extends State<ViewerPage> {
   bool _edgeHintVisible = false;
   DateTime? _lastBackPress;
   Timer? _middleTapTimer;
+  int _linkTapSerial = 0;
 
   /// Windows and other desktop targets get a visible toolbar plus keyboard
   /// shortcuts; touch targets keep the original chrome-free reading surface.
@@ -212,9 +213,7 @@ class _ViewerPageState extends State<ViewerPage> {
                       // The desktop toolbar replaces the invisible zones so a
                       // stray click never reloads the page.
                       enabled: !_drawerOpen && !_isDesktop,
-                      canRefresh: _controller.canReload,
-                      onRefresh: _controller.reload,
-                      onOpenPanel: () => setState(() => _drawerOpen = true),
+                      onEdgeTap: _handleEdgeTap,
                       hintVisible: _edgeHintVisible,
                       onMiddleTap: _handleMiddleTap,
                       onHideHint: _hideEdgeHint,
@@ -225,7 +224,7 @@ class _ViewerPageState extends State<ViewerPage> {
                           (left, dx, dy) =>
                               _resizeZone(left, dx, dy, constraints.biggest),
                       onZoneReset: _readerStore.resetEdgeZone,
-                      child: _BottomPullToRefresh(
+                      child: _PullToRefresh(
                         enabled: !_drawerOpen && _controller.canReload,
                         onRefresh: _controller.reload,
                         child: ScrollConfiguration(
@@ -338,12 +337,14 @@ class _ViewerPageState extends State<ViewerPage> {
         jumpNonce: _jumpNonce,
         onCurrentFloorChanged: _recordCurrentFloor,
         onFloorLinkTap: _openFloorLink,
+        onReply: () => _openComposer(ComposerMode.reply),
       );
     }
     return _GenericDocumentView(document: document);
   }
 
   void _navigate(Uri uri) {
+    _linkTapSerial++;
     _hideEdgeHint();
     final match = _threadPath.firstMatch(uri.path);
     final targetThread = match?.group(1);
@@ -360,6 +361,7 @@ class _ViewerPageState extends State<ViewerPage> {
   }
 
   void _openFloorLink(Uri uri) {
+    _linkTapSerial++;
     final floorMatch = RegExp(r'^f(\d+)$').firstMatch(uri.fragment);
     final document = _controller.document;
     if (floorMatch == null || document == null) {
@@ -525,6 +527,23 @@ class _ViewerPageState extends State<ViewerPage> {
         height: (zone.height + dy).clamp(80.0, size.height),
       ),
     );
+  }
+
+  /// A link tapped inside a zone must win over the zone. Raw pointer events
+  /// reach the surface before the gesture arena hands the tap to the link, so
+  /// the zone's action waits one microtask and stands down if a link claimed
+  /// the same tap in the meantime.
+  void _handleEdgeTap(bool left) {
+    final serial = _linkTapSerial;
+    scheduleMicrotask(() {
+      if (!mounted || _linkTapSerial != serial) return;
+      _hideEdgeHint();
+      if (left) {
+        if (_controller.canReload) unawaited(_controller.reload());
+      } else {
+        setState(() => _drawerOpen = true);
+      }
+    });
   }
 
   void _hideEdgeHint() {
@@ -727,9 +746,7 @@ class _EdgeTapSurface extends StatefulWidget {
     required this.leftZone,
     required this.rightZone,
     required this.enabled,
-    required this.canRefresh,
-    required this.onRefresh,
-    required this.onOpenPanel,
+    required this.onEdgeTap,
     required this.hintVisible,
     required this.onMiddleTap,
     required this.onHideHint,
@@ -743,9 +760,10 @@ class _EdgeTapSurface extends StatefulWidget {
   final _EdgeZoneGeometry leftZone;
   final _EdgeZoneGeometry rightZone;
   final bool enabled;
-  final bool canRefresh;
-  final VoidCallback onRefresh;
-  final VoidCallback onOpenPanel;
+
+  /// Reports that a zone was tapped. The page decides whether the tap really
+  /// belongs to the zone or to a link sitting on top of it.
+  final void Function(bool left) onEdgeTap;
 
   /// Whether the otherwise invisible zones are being shown as a reminder.
   final bool hintVisible;
@@ -766,20 +784,25 @@ class _EdgeTapSurfaceState extends State<_EdgeTapSurface> {
   static const _tapSlop = 12.0;
 
   Offset? _downPosition;
+  Duration? _downTime;
 
   @override
   Widget build(BuildContext context) {
     return Listener(
-      // Raw pointers, because the text's SelectionArea wins the gesture arena
-      // for taps. Long press still reaches it and still selects text.
-      onPointerDown: (event) => _downPosition = event.localPosition,
+      key: const Key('edge-tap-surface'),
+      // Every zone gesture is read from raw pointers. A GestureDetector here
+      // loses the arena to the SelectionArea wrapping each post, so an edge
+      // tap that happened to land on text was silently swallowed.
+      onPointerDown: (event) {
+        _downPosition = event.localPosition;
+        _downTime = event.timeStamp;
+      },
       onPointerUp: _handlePointerUp,
-      onPointerCancel: (_) => _downPosition = null,
-      child: GestureDetector(
-        key: const Key('edge-tap-surface'),
-        behavior: HitTestBehavior.translucent,
-        onTapUp: widget.enabled ? _handleTap : null,
-        child: Stack(
+      onPointerCancel: (_) {
+        _downPosition = null;
+        _downTime = null;
+      },
+      child: Stack(
           children: [
             Positioned.fill(
               child: NotificationListener<ScrollNotification>(
@@ -800,7 +823,6 @@ class _EdgeTapSurfaceState extends State<_EdgeTapSurface> {
               ..._buildZone(left: false),
             ],
           ],
-        ),
       ),
     );
   }
@@ -832,14 +854,7 @@ class _EdgeTapSurfaceState extends State<_EdgeTapSurface> {
           key: Key(left ? 'edge-hint-left' : 'edge-hint-right'),
           label: left ? '刷新' : '阅读工具',
           left: left,
-          onTap: () {
-            widget.onHideHint();
-            if (left) {
-              if (widget.canRefresh) widget.onRefresh();
-            } else {
-              widget.onOpenPanel();
-            }
-          },
+          onTap: () => widget.onEdgeTap(left),
           onMove: (delta) => widget.onZoneMoved(left, delta.dy),
           onResize: (delta) => widget.onZoneResized(left, delta.dx, delta.dy),
         ),
@@ -880,11 +895,26 @@ class _EdgeTapSurfaceState extends State<_EdgeTapSurface> {
 
   void _handlePointerUp(PointerUpEvent event) {
     final down = _downPosition;
+    final downTime = _downTime;
     _downPosition = null;
+    _downTime = null;
     if (!widget.enabled || down == null) return;
-    // A drag is a scroll, not a tap, and the edges run their own actions.
+    // A drag is a scroll, not a tap.
     if ((event.localPosition - down).distance > _tapSlop) return;
-    if (_inEdgeZone(down)) return;
+
+    if (_inEdgeZone(down)) {
+      // While shown, each zone handles its own tap so it can also drag,
+      // resize and put itself away.
+      if (widget.hintVisible) return;
+      // A held press belongs to the text underneath, so selecting and copying
+      // inside a zone still works.
+      final held = downTime == null ? Duration.zero : event.timeStamp - downTime;
+      if (held >= kLongPressTimeout) return;
+
+      widget.onEdgeTap(down.dx <= widget.leftZone.width);
+      return;
+    }
+
     // Working the reset button is an adjustment, not a tap somewhere else.
     if (widget.hintVisible &&
         ((_resetButtonRect(true)?.contains(down) ?? false) ||
@@ -892,20 +922,6 @@ class _EdgeTapSurfaceState extends State<_EdgeTapSurface> {
       return;
     }
     widget.onMiddleTap();
-  }
-
-  void _handleTap(TapUpDetails details) {
-    // While the zones are on screen they handle their own taps, along with
-    // dragging and resizing.
-    if (widget.hintVisible) return;
-    final position = details.localPosition;
-    if (!_inEdgeZone(position)) return;
-    widget.onHideHint();
-    if (position.dx <= widget.leftZone.width) {
-      if (widget.canRefresh) widget.onRefresh();
-    } else {
-      widget.onOpenPanel();
-    }
   }
 }
 
@@ -995,8 +1011,14 @@ class _EdgeHint extends StatelessWidget {
   }
 }
 
-class _BottomPullToRefresh extends StatefulWidget {
-  const _BottomPullToRefresh({
+/// Which end of the list the reader is pulling from.
+enum _PullEdge { top, bottom }
+
+/// Overscrolling either end far enough triggers a refresh. Both ends work, so
+/// the gesture is available whether the reader is at the newest post or the
+/// oldest one.
+class _PullToRefresh extends StatefulWidget {
+  const _PullToRefresh({
     required this.enabled,
     required this.onRefresh,
     required this.child,
@@ -1007,34 +1029,43 @@ class _BottomPullToRefresh extends StatefulWidget {
   final Widget child;
 
   @override
-  State<_BottomPullToRefresh> createState() => _BottomPullToRefreshState();
+  State<_PullToRefresh> createState() => _PullToRefreshState();
 }
 
-class _BottomPullToRefreshState extends State<_BottomPullToRefresh> {
+class _PullToRefreshState extends State<_PullToRefresh> {
   static const _triggerDistance = 64.0;
+
   double _pullDistance = 0;
   double _maxPullDistance = 0;
+  _PullEdge _edge = _PullEdge.bottom;
   bool _refreshing = false;
 
   bool get _armed => _maxPullDistance >= _triggerDistance;
 
+  String get _label {
+    if (_refreshing) return '正在刷新';
+    return _armed ? '松开刷新' : '继续拉动刷新';
+  }
+
   @override
   Widget build(BuildContext context) {
+    final showing = _refreshing || _pullDistance > 0;
     return NotificationListener<ScrollNotification>(
-      key: const Key('bottom-pull-refresh'),
+      key: const Key('pull-refresh'),
       onNotification: _handleScroll,
       child: Stack(
         children: [
           Positioned.fill(child: widget.child),
-          if (_pullDistance > 0)
+          if (showing)
             Positioned(
               left: 0,
               right: 0,
-              bottom: 8,
+              top: _edge == _PullEdge.top ? 8 : null,
+              bottom: _edge == _PullEdge.top ? null : 8,
               child: IgnorePointer(
                 child: Center(
                   child: Container(
-                    key: const Key('bottom-pull-refresh-indicator'),
+                    key: const Key('pull-refresh-indicator'),
                     padding: const EdgeInsets.symmetric(
                       horizontal: 10,
                       vertical: 4,
@@ -1044,7 +1075,7 @@ class _BottomPullToRefreshState extends State<_BottomPullToRefresh> {
                       border: Border.all(color: Colors.black),
                     ),
                     child: Text(
-                      _armed ? '松开刷新' : '继续拉动刷新',
+                      _label,
                       style: const TextStyle(
                         fontFamily: 'Saitamaar',
                         fontSize: 13,
@@ -1064,32 +1095,39 @@ class _BottomPullToRefreshState extends State<_BottomPullToRefresh> {
     if (notification.depth != 0 || notification.metrics.axis != Axis.vertical) {
       return false;
     }
-    if (!widget.enabled || _refreshing) {
-      _resetPull();
-      return false;
-    }
-    if (notification is ScrollUpdateNotification &&
-        notification.metrics.extentAfter <= 0.01) {
-      final beyondBottom =
-          notification.metrics.pixels - notification.metrics.maxScrollExtent;
-      if (beyondBottom > 0) {
-        _setPullDistance(beyondBottom);
+    // While a refresh runs the indicator stays put and says so; new pulls are
+    // ignored until it finishes.
+    if (!widget.enabled || _refreshing) return false;
+
+    final metrics = notification.metrics;
+    if (notification is OverscrollNotification) {
+      if (notification.overscroll > 0 && metrics.extentAfter <= 0.01) {
+        _setPull(_PullEdge.bottom, _pullDistance + notification.overscroll);
+      } else if (notification.overscroll < 0 && metrics.extentBefore <= 0.01) {
+        _setPull(_PullEdge.top, _pullDistance - notification.overscroll);
       }
-    } else if (notification is OverscrollNotification &&
-        notification.metrics.extentAfter <= 0.01 &&
-        notification.overscroll > 0) {
-      _setPullDistance(_pullDistance + notification.overscroll);
+    } else if (notification is ScrollUpdateNotification) {
+      final beyondBottom = metrics.pixels - metrics.maxScrollExtent;
+      final beyondTop = metrics.minScrollExtent - metrics.pixels;
+      if (beyondBottom > 0 && metrics.extentAfter <= 0.01) {
+        _setPull(_PullEdge.bottom, beyondBottom);
+      } else if (beyondTop > 0 && metrics.extentBefore <= 0.01) {
+        _setPull(_PullEdge.top, beyondTop);
+      }
     } else if (notification is ScrollEndNotification && _maxPullDistance > 0) {
-      final shouldRefresh = _armed;
-      _resetPull();
-      if (shouldRefresh) unawaited(_refresh());
+      if (_armed) {
+        unawaited(_refresh());
+      } else {
+        _resetPull();
+      }
     }
     return false;
   }
 
-  void _setPullDistance(double value) {
+  void _setPull(_PullEdge edge, double value) {
     final next = value.clamp(0, _triggerDistance * 1.5).toDouble();
     setState(() {
+      _edge = edge;
       _pullDistance = next;
       if (next > _maxPullDistance) _maxPullDistance = next;
     });
@@ -1105,11 +1143,21 @@ class _BottomPullToRefreshState extends State<_BottomPullToRefresh> {
 
   Future<void> _refresh() async {
     if (_refreshing) return;
-    _refreshing = true;
+    // Swap straight from "release" to "refreshing" in one frame so the
+    // indicator never blinks out between the two.
+    setState(() {
+      _refreshing = true;
+      _pullDistance = 0;
+      _maxPullDistance = 0;
+    });
     try {
       await widget.onRefresh();
     } finally {
-      _refreshing = false;
+      if (mounted) {
+        setState(() => _refreshing = false);
+      } else {
+        _refreshing = false;
+      }
     }
   }
 }
@@ -1425,6 +1473,7 @@ class _AaFanclubDocumentView extends StatelessWidget {
     required this.jumpNonce,
     required this.onCurrentFloorChanged,
     required this.onFloorLinkTap,
+    required this.onReply,
   });
 
   final ForumDocument document;
@@ -1434,6 +1483,7 @@ class _AaFanclubDocumentView extends StatelessWidget {
   final int jumpNonce;
   final ValueChanged<int> onCurrentFloorChanged;
   final ValueChanged<Uri> onFloorLinkTap;
+  final VoidCallback onReply;
 
   @override
   Widget build(BuildContext context) {
@@ -1446,6 +1496,7 @@ class _AaFanclubDocumentView extends StatelessWidget {
         jumpNonce: jumpNonce,
         onCurrentFloorChanged: onCurrentFloorChanged,
         onFloorLinkTap: onFloorLinkTap,
+        onReply: onReply,
       );
     }
     if (document.kind == ForumPageKind.board) {
@@ -1788,6 +1839,7 @@ class _ThreadView extends StatefulWidget {
     required this.jumpNonce,
     required this.onCurrentFloorChanged,
     required this.onFloorLinkTap,
+    required this.onReply,
     super.key,
   });
 
@@ -1797,6 +1849,7 @@ class _ThreadView extends StatefulWidget {
   final int jumpNonce;
   final ValueChanged<int> onCurrentFloorChanged;
   final ValueChanged<Uri> onFloorLinkTap;
+  final VoidCallback onReply;
 
   @override
   State<_ThreadView> createState() => _ThreadViewState();
@@ -1891,6 +1944,7 @@ class _ThreadViewState extends State<_ThreadView> {
     return _ClassicNavigation(
       document: widget.document,
       onNavigate: widget.onNavigate,
+      onReply: widget.onReply,
     );
   }
 
@@ -1935,10 +1989,18 @@ class _ThreadViewState extends State<_ThreadView> {
 }
 
 class _ClassicNavigation extends StatelessWidget {
-  const _ClassicNavigation({required this.document, required this.onNavigate});
+  const _ClassicNavigation({
+    required this.document,
+    required this.onNavigate,
+    this.onReply,
+  });
 
   final ForumDocument document;
   final ValueChanged<Uri> onNavigate;
+
+  /// Set only on the row under the last post, where a reader who has just
+  /// finished reading is most likely to want the composer.
+  final VoidCallback? onReply;
 
   @override
   Widget build(BuildContext context) {
@@ -1998,6 +2060,18 @@ class _ClassicNavigation extends StatelessWidget {
         ),
       );
       previousPage = page;
+    }
+    if (onReply != null) {
+      entries.add(
+        _NavCell(
+          key: const Key('nav-reply'),
+          child: ClassicLink(
+            '■回复■',
+            padding: cellPadding,
+            onTap: onReply!,
+          ),
+        ),
+      );
     }
     return SingleChildScrollView(
       scrollDirection: Axis.horizontal,

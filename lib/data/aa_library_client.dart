@@ -76,9 +76,51 @@ class AaSourceFile {
       directory: directory,
       filename: filename,
       filesize: (value['filesize'] as num?)?.toInt() ?? 0,
-      contents: List.unmodifiable(rawContents.whereType<String>()),
+      contents: List.unmodifiable(
+        rawContents.whereType<String>().map(decodeCharacterReferences),
+      ),
     );
   }
+}
+
+final _characterReference = RegExp(
+  r'&(?:#(\d{1,7})|#[xX]([0-9a-fA-F]{1,6})|(amp|lt|gt|quot|apos|nbsp));',
+);
+
+const _namedCharacterReferences = {
+  'amp': '&',
+  'lt': '<',
+  'gt': '>',
+  'quot': '"',
+  'apos': "'",
+  'nbsp': ' ',
+};
+
+/// Turns the HTML character references the AA source ships into the characters
+/// they stand for. The drawings are stored as HTML fragments, so a heart or a
+/// no-break space arrives as `&#9829;` or `&#xA0;`.
+///
+/// Leaving them encoded is not only ugly on screen: the composer measures text
+/// to place it, and an eight-character escape is nothing like the one glyph it
+/// represents, so every drawing containing one would be laid out wrong.
+///
+/// Only well-formed references are touched, in a single pass, so the `&`, `<`
+/// and `>` that AA uses as ordinary strokes are left exactly as they are.
+String decodeCharacterReferences(String source) {
+  if (!source.contains('&')) return source;
+  return source.replaceAllMapped(_characterReference, (match) {
+    final named = match.group(3);
+    if (named != null) return _namedCharacterReferences[named]!;
+    final digits = match.group(1);
+    final code =
+        digits != null
+            ? int.tryParse(digits)
+            : int.tryParse(match.group(2)!, radix: 16);
+    if (code == null || code < 0 || code > 0x10ffff) return match.group(0)!;
+    // Surrogate halves are not characters on their own.
+    if (code >= 0xd800 && code <= 0xdfff) return match.group(0)!;
+    return String.fromCharCode(code);
+  });
 }
 
 class AaLibraryException implements Exception {

@@ -25,12 +25,14 @@ class _AaPickerPageState extends State<AaPickerPage> {
   late final bool _ownsClient;
   late final bool _ownsStore;
   final _search = TextEditingController();
+  final _fileViewController = _AaFileViewController();
 
   List<AaSourceNode> _tree = const [];
   List<AaSourceNode> _allFiles = const [];
   final List<AaSourceNode> _folderStack = [];
   AaSourceNode? _selectedFile;
   List<_AaEntry> _fileEntries = const [];
+  List<_AaSection> _sections = const [];
   _AaPickerView _view = _AaPickerView.browse;
   bool _loadingTree = true;
   bool _loadingFile = false;
@@ -55,6 +57,7 @@ class _AaPickerPageState extends State<AaPickerPage> {
       ..removeListener(_onSearchChanged)
       ..dispose();
     _store.removeListener(_onStoreChanged);
+    _fileViewController.dispose();
     if (_ownsStore) _store.dispose();
     if (_ownsClient) _client.close();
     super.dispose();
@@ -251,6 +254,15 @@ class _AaPickerPageState extends State<AaPickerPage> {
           else
             const SizedBox(width: 12),
           Expanded(child: _buildBreadcrumbs()),
+          if (_view == _AaPickerView.browse &&
+              _selectedFile != null &&
+              _sections.any((section) => section.label != null))
+            IconButton(
+              key: const Key('aa-section-jump'),
+              tooltip: '跳到标签',
+              onPressed: _openSectionJump,
+              icon: const Icon(Icons.list, color: Colors.black),
+            ),
           if (_view == _AaPickerView.browse && _selectedFile != null)
             IconButton(
               key: ValueKey('aa-page-favorite-${_selectedFile!.hash}'),
@@ -458,11 +470,17 @@ class _AaPickerPageState extends State<AaPickerPage> {
     if (_fileEntries.isEmpty) {
       return const Center(child: Text('这个文件里没有可选择的 AA'));
     }
-    return _AaGrid(
-      entries: _fileEntries,
+    return _AaFileView(
+      key: ValueKey('aa-file-${_selectedFile!.hash}'),
+      sections: _sections,
+      initialEntryIndex: _store.pageProgress(_selectedFile!.hash),
+      onProgress:
+          (entryIndex) =>
+              _store.savePageProgress(_selectedFile!.hash, entryIndex),
       isFavorite: (entry) => _store.isAaFavorite(entry.id),
       onFavorite: _toggleFavorite,
       onSelect: _selectEntry,
+      controller: _fileViewController,
     );
   }
 
@@ -587,28 +605,20 @@ class _AaPickerPageState extends State<AaPickerPage> {
       _view = _AaPickerView.browse;
       _selectedFile = file;
       _fileEntries = const [];
+      _sections = const [];
       _fileError = null;
       _loadingFile = true;
     });
     _store.addPageHistory(AaSavedPage.fromSource(file));
     try {
       final contents = await _client.loadFile(file);
-      final candidates = <_AaEntry>[];
-      for (final (index, text) in contents.contents.indexed) {
-        if (_looksLikeAa(text)) {
-          candidates.add(_AaEntry.fromSource(file, index, text));
-        }
-      }
-      if (candidates.isEmpty) {
-        for (final (index, text) in contents.contents.indexed) {
-          if (text.trim().isNotEmpty) {
-            candidates.add(_AaEntry.fromSource(file, index, text));
-          }
-        }
-      }
+      final sections = _splitIntoSections(file, contents.contents);
       if (!mounted || _selectedFile?.hash != file.hash) return;
       setState(() {
-        _fileEntries = List.unmodifiable(candidates);
+        _sections = sections;
+        _fileEntries = List.unmodifiable(
+          sections.expand((section) => section.entries),
+        );
         _loadingFile = false;
       });
     } catch (error) {
@@ -713,6 +723,38 @@ class _AaPickerPageState extends State<AaPickerPage> {
       ..showSnackBar(SnackBar(content: Text(message)));
   }
 
+  /// The file's own headings, as a table of contents.
+  Future<void> _openSectionJump() async {
+    final labelled = <int>[
+      for (final (index, section) in _sections.indexed)
+        if (section.label != null) index,
+    ];
+    if (labelled.isEmpty) return;
+    final chosen = await showModalBottomSheet<int>(
+      context: context,
+      showDragHandle: true,
+      builder:
+          (context) => SafeArea(
+            child: ListView.separated(
+              key: const Key('aa-section-list'),
+              shrinkWrap: true,
+              itemCount: labelled.length,
+              separatorBuilder: (context, index) => const Divider(height: 1),
+              itemBuilder: (context, index) {
+                final section = _sections[labelled[index]];
+                return ListTile(
+                  key: ValueKey('aa-section-jump-${labelled[index]}'),
+                  title: Text(section.label!),
+                  subtitle: Text('${section.entries.length} 个 AA'),
+                  onTap: () => Navigator.pop(context, labelled[index]),
+                );
+              },
+            ),
+          ),
+    );
+    if (chosen != null) _fileViewController.jumpToSection(chosen);
+  }
+
   void _toggleFavorite(_AaEntry entry) {
     _store.toggleAaFavorite(entry.toSavedItem());
   }
@@ -803,10 +845,49 @@ class _AaPickerPageState extends State<AaPickerPage> {
     }
   }
 
+  /// An `.mlt` file interleaves short one-line headings with the drawings
+  /// they introduce. Everything from one heading to the next belongs together.
+  static List<_AaSection> _splitIntoSections(
+    AaSourceNode file,
+    List<String> contents,
+  ) {
+    final sections = <_AaSection>[_AaSection(label: null, entries: [])];
+    for (final (index, raw) in contents.indexed) {
+      final text = raw.trim();
+      if (text.isEmpty) continue;
+      if (_looksLikeAa(text)) {
+        sections.last.entries.add(_AaEntry.fromSource(file, index, raw));
+      } else {
+        sections.add(_AaSection(label: text.trim(), entries: []));
+      }
+    }
+    // A file with no drawings at all still deserves to show its lines.
+    if (sections.every((section) => section.entries.isEmpty)) {
+      final fallback = _AaSection(label: null, entries: []);
+      for (final (index, raw) in contents.indexed) {
+        if (raw.trim().isEmpty) continue;
+        fallback.entries.add(_AaEntry.fromSource(file, index, raw));
+      }
+      return [fallback];
+    }
+    sections.removeWhere(
+      (section) => section.entries.isEmpty && section.label == null,
+    );
+    return List.unmodifiable(sections);
+  }
+
   static bool _looksLikeAa(String text) {
     final normalized = text.trim();
     return normalized.contains('\n') || normalized.length >= 24;
   }
+}
+
+/// A heading from the source file plus the drawings that follow it.
+class _AaSection {
+  _AaSection({required this.label, required this.entries});
+
+  final String? label;
+  final List<_AaEntry> entries;
 }
 
 class _AaEntry {
@@ -903,8 +984,34 @@ class _AaGrid extends StatelessWidget {
       itemCount: entries.length,
       itemBuilder: (context, index) {
         final entry = entries[index];
-        final favorite = isFavorite(entry);
-        return Material(
+        return _AaCard(
+          entry: entry,
+          favorite: isFavorite(entry),
+          onFavorite: () => onFavorite(entry),
+          onSelect: () => onSelect(entry),
+        );
+      },
+    );
+  }
+}
+
+/// One AA thumbnail: its index, a favourite toggle, and the drawing itself.
+class _AaCard extends StatelessWidget {
+  const _AaCard({
+    required this.entry,
+    required this.favorite,
+    required this.onFavorite,
+    required this.onSelect,
+  });
+
+  final _AaEntry entry;
+  final bool favorite;
+  final VoidCallback onFavorite;
+  final VoidCallback onSelect;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
           key: ValueKey('aa-card-${entry.id}'),
           color: Colors.white,
           shape: const RoundedRectangleBorder(
@@ -932,7 +1039,7 @@ class _AaGrid extends StatelessWidget {
                       tooltip: favorite ? '取消收藏' : '收藏',
                       padding: EdgeInsets.zero,
                       visualDensity: VisualDensity.compact,
-                      onPressed: () => onFavorite(entry),
+                      onPressed: onFavorite,
                       icon: Icon(
                         favorite ? Icons.star : Icons.star_border,
                         color:
@@ -947,7 +1054,7 @@ class _AaGrid extends StatelessWidget {
               Expanded(
                 child: InkWell(
                   key: ValueKey('aa-select-${entry.id}'),
-                  onTap: () => onSelect(entry),
+                  onTap: onSelect,
                   child: Padding(
                     padding: const EdgeInsets.all(5),
                     child: CustomPaint(
@@ -959,8 +1066,6 @@ class _AaGrid extends StatelessWidget {
               ),
             ],
           ),
-        );
-      },
     );
   }
 }
@@ -1041,4 +1146,247 @@ class _ErrorView extends StatelessWidget {
       ),
     );
   }
+}
+
+/// Lets the page ask the file view to jump to one of its headings.
+class _AaFileViewController extends ChangeNotifier {
+  int? _requestedSection;
+
+  int? takeRequest() {
+    final request = _requestedSection;
+    _requestedSection = null;
+    return request;
+  }
+
+  void jumpToSection(int index) {
+    _requestedSection = index;
+    notifyListeners();
+  }
+}
+
+/// The contents of one `.mlt` file: the headings the source file carries, the
+/// drawings under each, a draggable scrollbar, and a remembered position.
+///
+/// Every row is laid out at a height this widget computes itself, so a row
+/// index converts to a pixel offset without measuring the tree. That is what
+/// lets both jumping to a heading and restoring a position land exactly.
+class _AaFileView extends StatefulWidget {
+  const _AaFileView({
+    required this.sections,
+    required this.initialEntryIndex,
+    required this.onProgress,
+    required this.isFavorite,
+    required this.onFavorite,
+    required this.onSelect,
+    required this.controller,
+    super.key,
+  });
+
+  final List<_AaSection> sections;
+  final int? initialEntryIndex;
+  final ValueChanged<int> onProgress;
+  final bool Function(_AaEntry entry) isFavorite;
+  final ValueChanged<_AaEntry> onFavorite;
+  final ValueChanged<_AaEntry> onSelect;
+  final _AaFileViewController controller;
+
+  @override
+  State<_AaFileView> createState() => _AaFileViewState();
+}
+
+class _AaFileViewState extends State<_AaFileView> {
+  static const _headerHeight = 40.0;
+  static const _padding = 7.0;
+  static const _spacing = 7.0;
+
+  final ScrollController _scroll = ScrollController();
+  List<_FileRow> _rows = const [];
+  List<double> _offsets = const [];
+  double _rowHeight = 0;
+  int _columns = 2;
+  bool _restored = false;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.controller.addListener(_onJumpRequested);
+    _scroll.addListener(_onScrolled);
+  }
+
+  @override
+  void dispose() {
+    widget.controller.removeListener(_onJumpRequested);
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  void _onJumpRequested() {
+    final section = widget.controller.takeRequest();
+    if (section == null || !_scroll.hasClients || _rows.isEmpty) return;
+    final row = _rows.indexWhere(
+      (item) => item.sectionIndex == section && item.isHeader,
+    );
+    _scroll.jumpTo(
+      _offsets[row < 0 ? 0 : row].clamp(0, _scroll.position.maxScrollExtent),
+    );
+  }
+
+  void _onScrolled() {
+    if (!_scroll.hasClients || _rows.isEmpty) return;
+    final entry = _rows[_rowAt(_scroll.offset)].firstEntryIndex;
+    if (entry != null) widget.onProgress(entry);
+  }
+
+  int _rowAt(double offset) {
+    for (var index = _rows.length - 1; index >= 0; index--) {
+      if (_offsets[index] <= offset + 1) return index;
+    }
+    return 0;
+  }
+
+  static int _columnsFor(double width) =>
+      width >= 1200
+          ? 5
+          : width >= 850
+          ? 4
+          : width >= 600
+          ? 3
+          : 2;
+
+  void _rebuildRows(double viewportWidth) {
+    _columns = _columnsFor(viewportWidth);
+    final cardWidth =
+        (viewportWidth - _padding * 2 - _spacing * (_columns - 1)) / _columns;
+    _rowHeight = cardWidth / 0.82 + _spacing;
+
+    final rows = <_FileRow>[];
+    for (final (sectionIndex, section) in widget.sections.indexed) {
+      final label = section.label;
+      if (label != null) {
+        rows.add(_FileRow.header(sectionIndex: sectionIndex, label: label));
+      }
+      for (var start = 0; start < section.entries.length; start += _columns) {
+        rows.add(
+          _FileRow.cards(
+            sectionIndex: sectionIndex,
+            entries: section.entries.sublist(
+              start,
+              math.min(start + _columns, section.entries.length),
+            ),
+          ),
+        );
+      }
+    }
+
+    final offsets = <double>[];
+    var running = _padding;
+    for (final row in rows) {
+      offsets.add(running);
+      running += row.isHeader ? _headerHeight : _rowHeight;
+    }
+
+    _rows = rows;
+    _offsets = offsets;
+  }
+
+  void _restoreOnce() {
+    if (_restored) return;
+    _restored = true;
+    final target = widget.initialEntryIndex;
+    if (target == null || _rows.isEmpty) return;
+    final row = _rows.lastIndexWhere(
+      (item) => item.firstEntryIndex != null && item.firstEntryIndex! <= target,
+    );
+    if (row <= 0) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_scroll.hasClients) return;
+      _scroll.jumpTo(_offsets[row].clamp(0, _scroll.position.maxScrollExtent));
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        _rebuildRows(constraints.maxWidth);
+        _restoreOnce();
+        return Scrollbar(
+          controller: _scroll,
+          thumbVisibility: true,
+          interactive: true,
+          child: ListView.builder(
+            key: const Key('aa-file-rows'),
+            controller: _scroll,
+            padding: const EdgeInsets.symmetric(vertical: _padding),
+            itemCount: _rows.length,
+            itemBuilder: (context, index) => _buildRow(_rows[index]),
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildRow(_FileRow row) {
+    if (row.isHeader) {
+      return Container(
+        key: ValueKey('aa-section-${row.sectionIndex}'),
+        height: _headerHeight,
+        width: double.infinity,
+        alignment: Alignment.centerLeft,
+        padding: const EdgeInsets.symmetric(horizontal: _padding + 3),
+        color: const Color(0xffeeeeee),
+        child: Text(
+          row.label!,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
+        ),
+      );
+    }
+    return SizedBox(
+      height: _rowHeight,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(_padding, 0, _padding, _spacing),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            for (final (position, entry) in row.entries.indexed) ...[
+              if (position > 0) const SizedBox(width: _spacing),
+              Expanded(
+                child: _AaCard(
+                  entry: entry,
+                  favorite: widget.isFavorite(entry),
+                  onFavorite: () => widget.onFavorite(entry),
+                  onSelect: () => widget.onSelect(entry),
+                ),
+              ),
+            ],
+            // Empty slots keep a short last row's cards the width of the rest.
+            for (var slot = row.entries.length; slot < _columns; slot++) ...[
+              const SizedBox(width: _spacing),
+              const Expanded(child: SizedBox.shrink()),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// One laid-out row: either a heading or up to a full line of cards.
+class _FileRow {
+  _FileRow.header({required this.sectionIndex, required this.label})
+    : entries = const [],
+      isHeader = true;
+
+  _FileRow.cards({required this.sectionIndex, required this.entries})
+    : label = null,
+      isHeader = false;
+
+  final int sectionIndex;
+  final String? label;
+  final List<_AaEntry> entries;
+  final bool isHeader;
+
+  int? get firstEntryIndex => entries.isEmpty ? null : entries.first.index;
 }

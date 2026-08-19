@@ -26,7 +26,13 @@ class ComposerTextLayer {
 typedef ComposerGlyphWidth = double Function(String text);
 
 /// Flattens bottom-to-top text layers into the exact plain text sent to the
-/// forum. Whitespace advances the cursor but never erases a lower layer.
+/// forum.
+///
+/// Whitespace at the start or end of a line only advances the cursor, so a
+/// window can be padded into place without blanking what it sits on. A run of
+/// whitespace with visible characters on both sides is treated as part of the
+/// drawing and does erase the layer below: in AA that gap is shaped on
+/// purpose, and letting the lower layer show through it breaks the picture.
 ///
 /// [measureWidth] and [spaceWidth] make padding follow the real font: the
 /// board renders in a proportional face, so a run of glyphs is not as wide as
@@ -54,57 +60,74 @@ String composeTextLayers(
   }
 
   for (final layer in layers) {
-    var row = layer.row;
     final startX = layer.column * spaceWidth;
-    var x = startX;
-    _PlacedGlyph? previous;
+    final lines = layer.text.replaceAll('\r', '').split('\n');
 
-    for (final rune in layer.text.runes) {
-      if (rune == 0x0d) continue;
-      if (rune == 0x0a) {
-        row++;
-        x = startX;
-        previous = null;
-        continue;
-      }
-      if (rune == 0x09) {
-        final stop = spaceWidth * 4;
-        x = ((x / stop).floor() + 1) * stop;
-        previous = null;
-        continue;
-      }
+    for (var lineIndex = 0; lineIndex < lines.length; lineIndex++) {
+      final row = layer.row + lineIndex;
+      final runes = lines[lineIndex].runes.toList(growable: false);
 
-      final glyph = String.fromCharCode(rune);
-      if (_isTransparentWhitespace(rune)) {
-        x += advanceOf(glyph, rune);
-        previous = null;
-        continue;
+      // Whitespace between the first and last visible character of a line is
+      // part of the drawing — a gap the artist shaped — so it hides the layer
+      // below. Leading and trailing whitespace stays transparent.
+      var firstInk = -1;
+      var lastInk = -1;
+      for (var index = 0; index < runes.length; index++) {
+        if (_isTransparentWhitespace(runes[index])) continue;
+        if (firstInk < 0) firstInk = index;
+        lastInk = index;
       }
 
-      final cells = _characterWidth(rune);
-      if (cells == 0 && previous != null) {
-        previous.text += glyph;
-        continue;
-      }
-      // A combining mark with nothing to attach to still needs to occupy a
-      // cell of its own, the way the old cell engine promoted it to width 1.
-      final advance = math.max(
-        advanceOf(glyph, rune),
-        cells == 0 ? spaceWidth : 0.0,
-      );
+      var x = startX;
+      _PlacedGlyph? previous;
 
-      // Anything before the origin is dropped rather than shifted, so what
-      // stays in frame keeps the position the author gave it.
-      if (row < 0 || x < -0.01) {
+      for (var index = 0; index < runes.length; index++) {
+        final rune = runes[index];
+        final interior = index > firstInk && index < lastInk;
+
+        if (rune == 0x09) {
+          final stop = spaceWidth * 4;
+          final next = ((x / stop).floor() + 1) * stop;
+          if (interior) _eraseRange(rows, row, x, next);
+          x = next;
+          previous = null;
+          continue;
+        }
+
+        final glyph = String.fromCharCode(rune);
+        if (_isTransparentWhitespace(rune)) {
+          final advance = advanceOf(glyph, rune);
+          if (interior) _eraseRange(rows, row, x, x + advance);
+          x += advance;
+          previous = null;
+          continue;
+        }
+
+        final cells = _characterWidth(rune);
+        if (cells == 0 && previous != null) {
+          previous.text += glyph;
+          continue;
+        }
+        // A combining mark with nothing to attach to still needs to occupy a
+        // cell of its own, the way the old cell engine promoted it to width 1.
+        final advance = math.max(
+          advanceOf(glyph, rune),
+          cells == 0 ? spaceWidth : 0.0,
+        );
+
+        // Anything before the origin is dropped rather than shifted, so what
+        // stays in frame keeps the position the author gave it.
+        if (row < 0 || x < -0.01) {
+          x += advance;
+          previous = null;
+          continue;
+        }
+
+        final placed = _PlacedGlyph(text: glyph, x: x, advance: advance);
+        _placeGlyph(rows.putIfAbsent(row, () => <_PlacedGlyph>[]), placed);
+        previous = placed;
         x += advance;
-        previous = null;
-        continue;
       }
-
-      final placed = _PlacedGlyph(text: glyph, x: x, advance: advance);
-      _placeGlyph(rows.putIfAbsent(row, () => <_PlacedGlyph>[]), placed);
-      previous = placed;
-      x += advance;
     }
   }
 
@@ -132,6 +155,21 @@ String composeTextLayers(
     output.write(line.toString().replaceFirst(RegExp(r' +$'), ''));
   }
   return output.toString().replaceFirst(RegExp(r'\n+$'), '');
+}
+
+/// Wipes `[start, end)` of [row] without putting anything in its place, so a
+/// gap inside a drawing reads as blank rather than showing the layer below.
+void _eraseRange(
+  Map<int, List<_PlacedGlyph>> rows,
+  int row,
+  double start,
+  double end,
+) {
+  if (row < 0 || end <= 0) return;
+  const epsilon = 0.01;
+  rows[row]?.removeWhere(
+    (existing) => existing.x < end - epsilon && start < existing.end - epsilon,
+  );
 }
 
 /// Inserts [glyph] in x order, erasing whatever it lands on top of.
@@ -185,6 +223,7 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
   bool _sending = false;
   bool _layerPanelOpen = false;
   bool _canvasParked = false;
+  double _previewScale = 1;
   final TransformationController _canvasTransform = TransformationController();
   Size _canvasSize = const Size(320, 360);
   Size _viewportSize = const Size(320, 360);
@@ -378,8 +417,9 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
                 const IgnorePointer(
                   child: Center(
                     child: Text(
+                      '只想发一段普通文字：直接点“确认”\n\n'
+                      '要拼 AA：点“嵌入文字”或“嵌入AA”添加窗口\n'
                       '拖动空白区域可移动画布，双指缩放\n'
-                      '点击“嵌入文字”或“嵌入AA”添加窗口\n'
                       '灰色斜线区域在正文之外，那里的文字不会发出去',
                       textAlign: TextAlign.center,
                       style: TextStyle(
@@ -407,49 +447,67 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
       color: const Color(0xffefefef),
       child: LayoutBuilder(
         builder: (context, constraints) {
-          // AA must not wrap, so the field is laid out at its widest line and
-          // the surplus is reached by scrolling sideways.
-          final longest = _preview!
-              .split('\n')
-              .map(_measureRun)
-              .fold(0.0, math.max);
-          final width = math.max(
-            constraints.maxWidth,
-            longest + _previewTextLeft + 24,
-          );
-          return SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            child: SizedBox(
-              width: width,
-              height: constraints.maxHeight,
-              child: Padding(
-                padding: const EdgeInsets.fromLTRB(
-                  _previewTextLeft,
-                  _previewTextTop - 1,
-                  6,
-                  5,
-                ),
-                child: TextField(
-                  key: const Key('composer-preview-text'),
-                  controller: _previewController,
-                  maxLines: null,
-                  expands: true,
-                  textAlignVertical: TextAlignVertical.top,
-                  keyboardType: TextInputType.multiline,
-                  style: AaText.baseStyle,
-                  strutStyle: const StrutStyle(
-                    fontFamily: 'Saitamaar',
-                    fontSize: 16,
-                    height: 1,
-                    forceStrutHeight: false,
+          return ValueListenableBuilder<TextEditingValue>(
+            valueListenable: _previewController,
+            builder: (context, value, _) {
+              // AA must not wrap, so the field is laid out at its widest line
+              // and the surplus is reached by scrolling sideways. Measured
+              // from the live text so it keeps up with typing.
+              final longest = value.text
+                  .split('\n')
+                  .map(_measureRun)
+                  .fold(0.0, math.max);
+              final natural = math.max(
+                constraints.maxWidth / _previewScale,
+                longest + _previewTextLeft + 24,
+              );
+              // Transform does not change layout, so the outer box takes the
+              // scaled footprint while the field lays out at its own size.
+              return SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: SizedBox(
+                  width: natural * _previewScale,
+                  height: constraints.maxHeight,
+                  child: Transform.scale(
+                    scale: _previewScale,
+                    alignment: Alignment.topLeft,
+                    child: SizedBox(
+                      width: natural,
+                      height: constraints.maxHeight / _previewScale,
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(
+                          _previewTextLeft,
+                          _previewTextTop - 1,
+                          6,
+                          5,
+                        ),
+                        child: TextField(
+                          key: const Key('composer-preview-text'),
+                          controller: _previewController,
+                          maxLines: null,
+                          expands: true,
+                          autofocus: true,
+                          textAlignVertical: TextAlignVertical.top,
+                          keyboardType: TextInputType.multiline,
+                          style: AaText.baseStyle,
+                          strutStyle: const StrutStyle(
+                            fontFamily: 'Saitamaar',
+                            fontSize: 16,
+                            height: 1,
+                            forceStrutHeight: false,
+                          ),
+                          decoration: const InputDecoration(
+                            border: InputBorder.none,
+                            isCollapsed: true,
+                            hintText: '在此输入回复内容',
+                          ),
+                        ),
+                      ),
+                    ),
                   ),
-                  decoration: const InputDecoration(
-                    border: InputBorder.none,
-                    isCollapsed: true,
-                  ),
                 ),
-              ),
-            ),
+              );
+            },
           );
         },
       ),
@@ -859,10 +917,6 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
       measureWidth: _measureRun,
       spaceWidth: _columnWidth,
     );
-    if (result.trim().isEmpty) {
-      _showMessage('请先嵌入文字内容');
-      return;
-    }
     if (widget.mode == ComposerMode.newThread &&
         _title.text.trim().length < 2) {
       _showMessage('帖子标题至少需要 2 个字符');
@@ -870,8 +924,15 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
     }
     FocusScope.of(context).unfocus();
     setState(() {
+      // An empty canvas is allowed through: the confirmed view doubles as a
+      // plain text box, which is all a one-line reply needs.
       _preview = result;
       _previewController.text = result;
+      // Carry the canvas zoom over so the text keeps the size it was read at.
+      _previewScale = _canvasTransform.value.getMaxScaleOnAxis().clamp(
+        0.35,
+        4.0,
+      );
       _layerPanelOpen = false;
     });
   }

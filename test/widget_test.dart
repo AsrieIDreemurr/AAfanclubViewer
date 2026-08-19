@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:aafanclub_viewer/app.dart';
@@ -96,9 +97,14 @@ class _FakeRepository extends ForumRepository {
     );
   }
 
+  /// Lets a test hold a refresh open to observe the in-progress state.
+  Future<void>? refreshGate;
+
   @override
   Future<ForumDocument> refresh(ForumDocument current) async {
     refreshCalls++;
+    final gate = refreshGate;
+    if (gate != null) await gate;
     return current;
   }
 
@@ -354,10 +360,73 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(repository.refreshCalls, 1);
-    expect(
-      find.byKey(const Key('bottom-pull-refresh-indicator')),
-      findsNothing,
-    );
+    expect(find.byKey(const Key('pull-refresh-indicator')), findsNothing);
+
+    // Pulling down at the top refreshes just as pulling up at the bottom does.
+    await tester.drag(thread, const Offset(0, 10000));
+    await tester.pumpAndSettle();
+    repository.refreshCalls = 0;
+
+    await tester.drag(thread, const Offset(0, 180));
+    await tester.pumpAndSettle();
+
+    expect(repository.refreshCalls, 1);
+    expect(find.byKey(const Key('pull-refresh-indicator')), findsNothing);
+  });
+
+  testWidgets('the bottom nav row carries a reply button', (tester) async {
+    final repository = _FakeRepository();
+    await tester.pumpWidget(AaFanclubApp(repository: repository));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('测试帖子').first);
+    await tester.pumpAndSettle();
+
+    // Only the row under the last post has it, not the one above the thread.
+    expect(find.byKey(const Key('nav-reply')), findsOneWidget);
+    await tester.tap(find.byKey(const Key('nav-reply')));
+    await tester.pumpAndSettle();
+
+    expect(find.byKey(const Key('post-composer-sheet')), findsOneWidget);
+    expect(find.byKey(const Key('composer-thread-title')), findsNothing);
+  });
+
+  testWidgets('the pull indicator says it is refreshing while it runs', (
+    tester,
+  ) async {
+    final repository = _FakeRepository();
+    await tester.pumpWidget(AaFanclubApp(repository: repository));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('测试帖子').first);
+    await tester.pumpAndSettle();
+
+    final thread = find.byType(ScrollablePositionedList);
+    await tester.drag(thread, const Offset(0, 10000));
+    await tester.pumpAndSettle();
+
+    // Hold the next refresh open only now, so opening the thread could settle.
+    final gate = Completer<void>();
+    repository.refreshGate = gate.future;
+
+    // Hold the drag past the trigger so the "release" wording shows first.
+    final start = tester.getCenter(thread);
+    final gesture = await tester.startGesture(start);
+    await gesture.moveBy(const Offset(0, 180));
+    await tester.pump();
+    expect(find.text('松开刷新'), findsOneWidget);
+
+    // The bounce has to spring back before the scroll reports it ended, and
+    // pumpAndSettle cannot be used here: the loading bar animates forever
+    // while the gated refresh is in flight.
+    await gesture.up();
+    for (var frame = 0; frame < 40 && repository.refreshCalls < 3; frame++) {
+      await tester.pump(const Duration(milliseconds: 50));
+    }
+    expect(find.text('正在刷新'), findsOneWidget);
+    expect(find.text('松开刷新'), findsNothing);
+
+    gate.complete();
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('pull-refresh-indicator')), findsNothing);
   });
 
   testWidgets('restores a cached page and jumps to an off-screen floor', (
@@ -585,6 +654,40 @@ void main() {
     await tester.tapAt(middle);
     await tester.pumpAndSettle();
     expect(find.byKey(const Key('edge-hint-left')), findsNothing);
+  });
+
+  testWidgets('an edge tap works even when it lands on selectable text', (
+    tester,
+  ) async {
+    final repository = _FakeRepository();
+    await tester.pumpWidget(AaFanclubApp(repository: repository));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('测试帖子').first);
+    await tester.pumpAndSettle();
+    repository.refreshCalls = 0;
+
+    // Find a spot inside the left zone that is covered by a post's
+    // SelectionArea — that combination used to swallow the tap outright,
+    // because SelectionArea wins the gesture arena against an ancestor.
+    final surface = tester.getRect(find.byKey(const Key('edge-tap-surface')));
+    final zone = Rect.fromLTWH(0, (surface.height - 156) / 2, 96, 156);
+    Offset? onText;
+    for (final element in find.byType(SelectionArea).evaluate()) {
+      final box = element.renderObject as RenderBox?;
+      if (box == null || !box.hasSize) continue;
+      final overlap = (box.localToGlobal(Offset.zero) & box.size).intersect(
+        zone,
+      );
+      if (overlap.width > 4 && overlap.height > 4) {
+        onText = overlap.center;
+        break;
+      }
+    }
+    expect(onText, isNotNull, reason: '需要一个既在点击区内、又在文字上的点');
+
+    await tester.tapAt(onText!);
+    await tester.pumpAndSettle();
+    expect(repository.refreshCalls, 1);
   });
 
   testWidgets('a shown edge zone can be moved, resized and reset', (

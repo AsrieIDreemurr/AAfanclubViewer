@@ -30,11 +30,18 @@ class _FakeAaLibraryClient extends AaLibraryClient {
 
   @override
   Future<AaSourceFile> loadFile(AaSourceNode node) async {
-    return const AaSourceFile(
+    // Shaped like a real .mlt: short one-line headings interleaved with the
+    // multi-line drawings that belong under them.
+    return AaSourceFile(
       directory: '/あ行',
       filename: '作品.mlt',
       filesize: 100,
-      contents: ['【基本】', '  /\\\n ( ･ω･)'],
+      contents: [
+        '【基本】',
+        for (var i = 0; i < 12; i++) '  /\\\n ( ･ω･) 基本 $i',
+        '【応用】',
+        for (var i = 0; i < 12; i++) '  /\\\n ( ･ω･) 応用 $i',
+      ],
     );
   }
 
@@ -44,6 +51,73 @@ class _FakeAaLibraryClient extends AaLibraryClient {
 
 void main() {
   setUp(() => SharedPreferences.setMockInitialValues({}));
+
+  testWidgets('a file shows its headings and can jump between them', (
+    tester,
+  ) async {
+    final store = AaLibraryStore();
+    await tester.pumpWidget(
+      MaterialApp(
+        home: AaPickerPage(client: _FakeAaLibraryClient(), store: store),
+      ),
+    );
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('aa-node-folder-1')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('aa-node-file-1')));
+    await tester.pumpAndSettle();
+
+    // The source file's headings are shown as section titles.
+    expect(find.byKey(const ValueKey('aa-section-0')), findsOneWidget);
+    expect(find.text('【基本】'), findsOneWidget);
+
+    final list = find.byKey(const Key('aa-file-rows'));
+    final before = tester.widget<ListView>(list).controller!.offset;
+
+    await tester.tap(find.byKey(const Key('aa-section-jump')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('aa-section-jump-1')));
+    await tester.pumpAndSettle();
+
+    // Jumping to the second heading scrolls the list down to it.
+    final after = tester.widget<ListView>(list).controller!.offset;
+    expect(after, greaterThan(before));
+    expect(find.text('【応用】'), findsOneWidget);
+  });
+
+  testWidgets('a file reopens at the position it was left', (tester) async {
+    final store = AaLibraryStore();
+    Future<void> openFile() async {
+      await tester.pumpWidget(
+        MaterialApp(
+          home: AaPickerPage(client: _FakeAaLibraryClient(), store: store),
+        ),
+      );
+      await tester.pumpAndSettle();
+    }
+
+    await openFile();
+    await tester.tap(find.byKey(const ValueKey('aa-node-folder-1')));
+    await tester.pumpAndSettle();
+    await tester.tap(find.byKey(const ValueKey('aa-node-file-1')));
+    await tester.pumpAndSettle();
+
+    final list = find.byKey(const Key('aa-file-rows'));
+    await tester.drag(list, const Offset(0, -900));
+    await tester.pumpAndSettle();
+    final left = tester.widget<ListView>(list).controller!.offset;
+    expect(left, greaterThan(0));
+    expect(store.pageProgress('file-1'), isNotNull);
+
+    // A fresh picker over the same store lands back where reading stopped.
+    await openFile();
+    final restored =
+        tester
+            .widget<ListView>(find.byKey(const Key('aa-file-rows')))
+            .controller!
+            .offset;
+    expect(restored, greaterThan(0));
+  });
 
   testWidgets('the path above a file walks back to its folders', (
     tester,
@@ -176,7 +250,7 @@ void main() {
     await tester.tap(find.byKey(const ValueKey('aa-node-file-1')));
     await tester.pumpAndSettle();
 
-    expect(find.byKey(const Key('aa-grid')), findsOneWidget);
+    expect(find.byKey(const Key('aa-file-rows')), findsOneWidget);
     expect(store.pageHistory.single.fileHash, 'file-1');
     await tester.tap(find.byKey(const ValueKey('aa-page-favorite-file-1')));
     await tester.pump();

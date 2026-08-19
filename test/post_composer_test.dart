@@ -29,6 +29,47 @@ void main() {
     );
   });
 
+  test('a gap inside a drawing hides the layer below it', () {
+    // The lower layer is a solid run; the upper one has a shaped gap. The gap
+    // blanks the run underneath — without this rule it would read 'AXXXBXXX'.
+    expect(
+      composeTextLayers(const [
+        ComposerTextLayer(text: 'XXXXXXXX', row: 0, column: 0),
+        ComposerTextLayer(text: 'A   B', row: 0, column: 0),
+      ]),
+      'A   BXXX',
+    );
+
+    // Leading and trailing whitespace still lets the lower layer through,
+    // which is what lets a window be padded into position.
+    expect(
+      composeTextLayers(const [
+        ComposerTextLayer(text: 'XXXXXXXX', row: 0, column: 0),
+        ComposerTextLayer(text: '  A  ', row: 0, column: 0),
+      ]),
+      'XXAXXXXX',
+    );
+
+    // The rule is per line: the gap on the second line must not blank the
+    // first line's characters.
+    expect(
+      composeTextLayers(const [
+        ComposerTextLayer(text: 'XXXX\nXXXX', row: 0, column: 0),
+        ComposerTextLayer(text: '  A\nB  C', row: 0, column: 0),
+      ]),
+      'XXAX\nB  C',
+    );
+
+    // A window with nothing but whitespace has no interior at all.
+    expect(
+      composeTextLayers(const [
+        ComposerTextLayer(text: 'XXXX', row: 0, column: 0),
+        ComposerTextLayer(text: '    ', row: 0, column: 0),
+      ]),
+      'XXXX',
+    );
+  });
+
   test('padding follows measured width so windows stay in column', () {
     // A proportional face where 'W' is twice a space and 'i' is half of one —
     // the shape that used to shear the right-hand window row by row.
@@ -199,6 +240,46 @@ void main() {
       findsOneWidget,
     );
     expect(submitCalls, 0);
+  });
+
+  testWidgets('an empty canvas confirms straight into a plain text box', (
+    tester,
+  ) async {
+    String? sent;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: PostComposerSheet(
+            mode: ComposerMode.reply,
+            onSubmit: (title, content) async {
+              sent = content;
+              return true;
+            },
+          ),
+        ),
+      ),
+    );
+
+    // No windows at all — 确认 still opens the editor, which is all a
+    // one-line reply needs.
+    expect(find.byKey(const ValueKey('composer-layer-0')), findsNothing);
+    await tester.tap(find.byKey(const Key('composer-primary-action')));
+    await tester.pumpAndSettle();
+    expect(find.byKey(const Key('composer-preview')), findsOneWidget);
+
+    final field = find.byKey(const Key('composer-preview-text'));
+    expect(tester.widget<TextField>(field).controller?.text, isEmpty);
+
+    // Sending nothing is still refused.
+    await tester.tap(find.byKey(const Key('composer-primary-action')));
+    await tester.pumpAndSettle();
+    expect(sent, isNull);
+
+    await tester.enterText(field, '单行回复');
+    await tester.pump();
+    await tester.tap(find.byKey(const Key('composer-primary-action')));
+    await tester.pumpAndSettle();
+    expect(sent, '单行回复');
   });
 
   testWidgets('new-thread composer owns a separate title field', (

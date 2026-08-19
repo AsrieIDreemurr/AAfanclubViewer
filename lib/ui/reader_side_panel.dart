@@ -156,28 +156,6 @@ class _ReaderSidePanelState extends State<ReaderSidePanel> {
                       // to a different place as the page state changes.
                       _ButtonRow(
                         children: [
-                          _ClassicButton(label: '首页', onPressed: widget.onHome),
-                          _ClassicButton(
-                            key: const Key('panel-previous-page'),
-                            label: '◀ 上一页',
-                            onPressed:
-                                widget.currentPage > 1
-                                    ? widget.onPreviousPage
-                                    : null,
-                          ),
-                          _ClassicButton(
-                            key: const Key('panel-next-page'),
-                            label: '下一页 ▶',
-                            onPressed:
-                                widget.currentPage < widget.pageCount
-                                    ? widget.onNextPage
-                                    : null,
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 5),
-                      _ButtonRow(
-                        children: [
                           _ClassicButton(
                             key: const Key('panel-reply'),
                             label: '回复',
@@ -198,6 +176,28 @@ class _ReaderSidePanelState extends State<ReaderSidePanel> {
                             key: const Key('panel-jump-floor'),
                             label: '跳楼层',
                             onPressed: isThread ? widget.onJumpToFloor : null,
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 5),
+                      _ButtonRow(
+                        children: [
+                          _ClassicButton(label: '首页', onPressed: widget.onHome),
+                          _ClassicButton(
+                            key: const Key('panel-previous-page'),
+                            label: '◀ 上一页',
+                            onPressed:
+                                widget.currentPage > 1
+                                    ? widget.onPreviousPage
+                                    : null,
+                          ),
+                          _ClassicButton(
+                            key: const Key('panel-next-page'),
+                            label: '下一页 ▶',
+                            onPressed:
+                                widget.currentPage < widget.pageCount
+                                    ? widget.onNextPage
+                                    : null,
                           ),
                         ],
                       ),

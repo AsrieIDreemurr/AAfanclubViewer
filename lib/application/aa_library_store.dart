@@ -222,12 +222,14 @@ class AaLibraryStore extends ChangeNotifier {
   static const _favoritePagesKey = 'aa.library.favorite-pages.v1';
   static const _pageHistoryKey = 'aa.library.page-history.v1';
   static const _favoriteFoldersKey = 'aa.library.favorite-folders.v1';
+  static const _pageProgressKey = 'aa.library.page-progress.v1';
 
   SharedPreferences? _preferences;
   final List<AaSavedItem> _favoriteAas = [];
   final List<AaSavedPage> _favoritePages = [];
   final List<AaSavedPage> _pageHistory = [];
   final List<AaSavedFolder> _favoriteFolders = [];
+  final Map<String, int> _pageProgress = {};
   bool _loaded = false;
 
   bool get loaded => _loaded;
@@ -262,6 +264,18 @@ class AaLibraryStore extends ChangeNotifier {
         preferences.getString(_favoriteFoldersKey),
         _favoriteFolders,
       );
+
+      final rawProgress = preferences.getString(_pageProgressKey);
+      if (rawProgress != null) {
+        final decoded = jsonDecode(rawProgress);
+        if (decoded is Map) {
+          decoded.forEach((key, value) {
+            if (key is String && value is num) {
+              _pageProgress[key] = value.toInt();
+            }
+          });
+        }
+      }
       if (_pageHistory.isEmpty) {
         final legacyHistory = <AaSavedItem>[];
         _decodeAaList(
@@ -319,6 +333,19 @@ class AaLibraryStore extends ChangeNotifier {
     }
     notifyListeners();
     _savePages(_favoritePagesKey, _favoritePages);
+  }
+
+  /// Which entry of a file was last on screen, so reopening it lands where
+  /// reading stopped. Stored as an entry index rather than a pixel offset so
+  /// it survives a different window width or column count.
+  int? pageProgress(String fileHash) => _pageProgress[fileHash];
+
+  void savePageProgress(String fileHash, int entryIndex) {
+    if (_pageProgress[fileHash] == entryIndex) return;
+    _pageProgress[fileHash] = entryIndex;
+    final preferences = _preferences;
+    if (preferences == null) return;
+    unawaited(preferences.setString(_pageProgressKey, jsonEncode(_pageProgress)));
   }
 
   bool isFolderFavorite(String hash) {
