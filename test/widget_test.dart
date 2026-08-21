@@ -374,6 +374,43 @@ void main() {
     expect(find.byKey(const Key('pull-refresh-indicator')), findsNothing);
   });
 
+  testWidgets('easing a pull back before letting go calls it off', (
+    tester,
+  ) async {
+    final repository = _FakeRepository();
+    await tester.pumpWidget(AaFanclubApp(repository: repository));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('测试帖子').first);
+    await tester.pumpAndSettle();
+
+    final thread = find.byType(ScrollablePositionedList);
+    await tester.drag(thread, const Offset(0, 10000));
+    await tester.pumpAndSettle();
+    repository.refreshCalls = 0;
+
+    final gesture = await tester.startGesture(tester.getCenter(thread));
+    await gesture.moveBy(const Offset(0, 200));
+    await tester.pump();
+    expect(find.text('松开刷新'), findsOneWidget);
+
+    // Ease back above the threshold: the prompt reverts. A real finger moves
+    // in small steps, and bouncing physics damps one big jump far more than
+    // the same distance travelled gradually.
+    for (var step = 0;
+        step < 60 && find.text('松开刷新').evaluate().isNotEmpty;
+        step++) {
+      await gesture.moveBy(const Offset(0, -12));
+      await tester.pump();
+    }
+    expect(find.text('松开刷新'), findsNothing);
+
+    // ...and letting go now does nothing at all.
+    await gesture.up();
+    await tester.pumpAndSettle();
+    expect(repository.refreshCalls, 0);
+    expect(find.byKey(const Key('pull-refresh-indicator')), findsNothing);
+  });
+
   testWidgets('the bottom nav row carries a reply button', (tester) async {
     final repository = _FakeRepository();
     await tester.pumpWidget(AaFanclubApp(repository: repository));
@@ -417,10 +454,9 @@ void main() {
     // The bounce has to spring back before the scroll reports it ended, and
     // pumpAndSettle cannot be used here: the loading bar animates forever
     // while the gated refresh is in flight.
+    // The refresh starts on release, without waiting out the rebound.
     await gesture.up();
-    for (var frame = 0; frame < 40 && repository.refreshCalls < 3; frame++) {
-      await tester.pump(const Duration(milliseconds: 50));
-    }
+    await tester.pump();
     expect(find.text('正在刷新'), findsOneWidget);
     expect(find.text('松开刷新'), findsNothing);
 

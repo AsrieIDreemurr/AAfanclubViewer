@@ -1,11 +1,17 @@
+import 'dart:convert';
 import 'dart:math' as math;
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import 'aa_picker_page.dart';
 import 'aa_text.dart';
 
 enum ComposerMode { reply, newThread }
+
+/// Whether tapping a window marks the whitespace run under the finger, and
+/// whether the mark reaches the rows above and below.
+enum _SpaceSelection { off, single, crossLine, erase }
 
 typedef ComposerSubmitCallback =
     Future<bool> Function(String? title, String content);
@@ -15,11 +21,104 @@ class ComposerTextLayer {
     required this.text,
     required this.row,
     required this.column,
+    this.transparentSpans = const [],
   });
 
   final String text;
   final int row;
   final int column;
+
+  /// Runs of whitespace the author marked as see-through, overriding the rule
+  /// that whitespace inside a drawing hides the layer below.
+  final List<ComposerSpan> transparentSpans;
+}
+
+/// A run of characters on one line of a layer, in rune indices.
+class ComposerSpan {
+  const ComposerSpan({
+    required this.line,
+    required this.start,
+    required this.end,
+  });
+
+  final int line;
+  final int start;
+  final int end;
+
+  bool covers(int line, int index) =>
+      line == this.line && index >= start && index < end;
+
+  @override
+  bool operator ==(Object other) =>
+      other is ComposerSpan &&
+      other.line == line &&
+      other.start == start &&
+      other.end == end;
+
+  @override
+  int get hashCode => Object.hash(line, start, end);
+}
+
+/// The run of whitespace sitting under [x] on [line], measured in the board's
+/// own font, or null when that pixel is not on a space.
+///
+/// The anchor is a pixel offset rather than a character index because the font
+/// is proportional: the same index lands somewhere different on every line.
+ComposerSpan? spaceRunAt(
+  String line,
+  int lineIndex,
+  double x,
+  ComposerGlyphWidth measure,
+) {
+  final runes = line.runes.toList(growable: false);
+  var cursor = 0.0;
+  for (var index = 0; index < runes.length; index++) {
+    final advance = measure(String.fromCharCode(runes[index]));
+    if (x >= cursor && x < cursor + advance) {
+      if (!_isTransparentWhitespace(runes[index])) return null;
+      var start = index;
+      while (start > 0 && _isTransparentWhitespace(runes[start - 1])) {
+        start--;
+      }
+      var end = index + 1;
+      while (end < runes.length && _isTransparentWhitespace(runes[end])) {
+        end++;
+      }
+      return ComposerSpan(line: lineIndex, start: start, end: end);
+    }
+    cursor += advance;
+  }
+  return null;
+}
+
+/// The whitespace run at [x] on [line], plus — when [crossLines] is set — the
+/// runs directly above and below it that share the same pixel column, stopping
+/// at the first row where that column is not blank.
+List<ComposerSpan> connectedSpaceRuns(
+  List<String> lines,
+  int line,
+  double x,
+  ComposerGlyphWidth measure, {
+  required bool crossLines,
+}) {
+  if (line < 0 || line >= lines.length) return const [];
+  final here = spaceRunAt(lines[line], line, x, measure);
+  if (here == null) return const [];
+  if (!crossLines) return [here];
+
+  final spans = <ComposerSpan>[here];
+  for (var above = line - 1; above >= 0; above--) {
+    final run = spaceRunAt(lines[above], above, x, measure);
+    if (run == null) break;
+    spans.add(run);
+  }
+  for (var below = line + 1; below < lines.length; below++) {
+    final run = spaceRunAt(lines[below], below, x, measure);
+    if (run == null) break;
+    spans.add(run);
+  }
+  spans.sort((a, b) => a.line.compareTo(b.line));
+  return spans;
 }
 
 /// Measures the rendered width of a run of text in the forum's own font.
@@ -97,7 +196,11 @@ String composeTextLayers(
         final glyph = String.fromCharCode(rune);
         if (_isTransparentWhitespace(rune)) {
           final advance = advanceOf(glyph, rune);
-          if (interior) _eraseRange(rows, row, x, x + advance);
+          // A run the author marked stays see-through even in mid-drawing.
+          final marked = layer.transparentSpans.any(
+            (span) => span.covers(lineIndex, index),
+          );
+          if (interior && !marked) _eraseRange(rows, row, x, x + advance);
           x += advance;
           previous = null;
           continue;
@@ -219,10 +322,18 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
   final _previewController = TextEditingController();
   final List<_EditorLayer> _layers = [];
   int _nextLayerId = 0;
+  int _nextTextNumber = 1;
+  int _nextAaNumber = 1;
   String? _preview;
   bool _sending = false;
   bool _layerPanelOpen = false;
   bool _canvasParked = false;
+  var _spaceSelection = _SpaceSelection.off;
+
+  /// Snapshots of every layer's marks, so marking can be stepped back and
+  /// forward. Index points at the state currently on screen.
+  final List<Map<int, List<ComposerSpan>>> _markHistory = [{}];
+  int _markHistoryIndex = 0;
   double _previewScale = 1;
   final TransformationController _canvasTransform = TransformationController();
   Size _canvasSize = const Size(320, 360);
@@ -417,8 +528,8 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
                 const IgnorePointer(
                   child: Center(
                     child: Text(
-                      '只想发一段普通文字：直接点“确认”\n\n'
-                      '要拼 AA：点“嵌入文字”或“嵌入AA”添加窗口\n'
+                      '点击“嵌入文字”或“嵌入AA”开始编辑AA\n'
+                      '点击“确认”进入文本编辑模式\n\n'
                       '拖动空白区域可移动画布，双指缩放\n'
                       '灰色斜线区域在正文之外，那里的文字不会发出去',
                       textAlign: TextAlign.center,
@@ -447,67 +558,58 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
       color: const Color(0xffefefef),
       child: LayoutBuilder(
         builder: (context, constraints) {
-          return ValueListenableBuilder<TextEditingValue>(
-            valueListenable: _previewController,
-            builder: (context, value, _) {
-              // AA must not wrap, so the field is laid out at its widest line
-              // and the surplus is reached by scrolling sideways. Measured
-              // from the live text so it keeps up with typing.
-              final longest = value.text
-                  .split('\n')
-                  .map(_measureRun)
-                  .fold(0.0, math.max);
-              final natural = math.max(
-                constraints.maxWidth / _previewScale,
-                longest + _previewTextLeft + 24,
-              );
-              // Transform does not change layout, so the outer box takes the
-              // scaled footprint while the field lays out at its own size.
-              return SingleChildScrollView(
-                scrollDirection: Axis.horizontal,
-                child: SizedBox(
-                  width: natural * _previewScale,
-                  height: constraints.maxHeight,
-                  child: Transform.scale(
-                    scale: _previewScale,
-                    alignment: Alignment.topLeft,
-                    child: SizedBox(
-                      width: natural,
-                      height: constraints.maxHeight / _previewScale,
-                      child: Padding(
-                        padding: const EdgeInsets.fromLTRB(
-                          _previewTextLeft,
-                          _previewTextTop - 1,
-                          6,
-                          5,
+          // AA must never wrap. Rather than sizing the field to a width this
+          // code measures — where being a pixel short silently folds a line —
+          // the field is given its own intrinsic width, which for unwrapped
+          // text is exactly the longest line. The surplus is reached by
+          // scrolling sideways.
+          //
+          // The canvas zoom carries over as a text scale, so it changes the
+          // laid-out size too and the scroll extent stays honest.
+          return SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: MediaQuery(
+              data: MediaQuery.of(
+                context,
+              ).copyWith(textScaler: TextScaler.linear(_previewScale)),
+              child: IntrinsicWidth(
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(minWidth: constraints.maxWidth),
+                  child: SizedBox(
+                    height: constraints.maxHeight,
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(
+                        _previewTextLeft,
+                        _previewTextTop - 1,
+                        24,
+                        5,
+                      ),
+                      child: TextField(
+                        key: const Key('composer-preview-text'),
+                        controller: _previewController,
+                        maxLines: null,
+                        expands: true,
+                        autofocus: true,
+                        textAlignVertical: TextAlignVertical.top,
+                        keyboardType: TextInputType.multiline,
+                        style: AaText.baseStyle,
+                        strutStyle: const StrutStyle(
+                          fontFamily: 'Saitamaar',
+                          fontSize: 16,
+                          height: 1,
+                          forceStrutHeight: false,
                         ),
-                        child: TextField(
-                          key: const Key('composer-preview-text'),
-                          controller: _previewController,
-                          maxLines: null,
-                          expands: true,
-                          autofocus: true,
-                          textAlignVertical: TextAlignVertical.top,
-                          keyboardType: TextInputType.multiline,
-                          style: AaText.baseStyle,
-                          strutStyle: const StrutStyle(
-                            fontFamily: 'Saitamaar',
-                            fontSize: 16,
-                            height: 1,
-                            forceStrutHeight: false,
-                          ),
-                          decoration: const InputDecoration(
-                            border: InputBorder.none,
-                            isCollapsed: true,
-                            hintText: '在此输入回复内容',
-                          ),
+                        decoration: const InputDecoration(
+                          border: InputBorder.none,
+                          isCollapsed: true,
+                          hintText: '在此输入回复内容',
                         ),
                       ),
                     ),
                   ),
                 ),
-              );
-            },
+              ),
+            ),
           );
         },
       ),
@@ -549,7 +651,7 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
                     children: [
                       Expanded(
                         child: Text(
-                          '文字 ${_layers.indexOf(layer) + 1}',
+                          layer.label,
                           style: const TextStyle(
                             fontFamily: 'Saitamaar',
                             fontSize: 13,
@@ -571,7 +673,21 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
                 ),
               ),
               Expanded(
-                child: Padding(
+                child: Stack(
+                  children: [
+                    Positioned.fill(
+                      child: CustomPaint(
+                        painter: _SpaceMarkPainter(
+                          spans: layer.transparentSpans,
+                          lines: _layerLines(layer),
+                          measure: _measureRun,
+                          rowHeight: _rowHeight,
+                          textLeft: _editorTextLeft,
+                          textTop: _editorTextTop,
+                        ),
+                      ),
+                    ),
+                    Padding(
                   padding: const EdgeInsets.symmetric(
                     horizontal: _editorTextLeft,
                   ),
@@ -596,6 +712,24 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
                       forceStrutHeight: false,
                     ),
                   ),
+                ),
+                    // While a selection mode is on, a tap marks whitespace
+                    // instead of moving the caret.
+                    if (_spaceSelection == _SpaceSelection.single ||
+                        _spaceSelection == _SpaceSelection.crossLine)
+                      Positioned.fill(
+                        // A raw pointer listener, because the window's own
+                        // double-tap recognizer would otherwise hold the
+                        // gesture arena open and swallow this tap.
+                        child: Listener(
+                          key: ValueKey('composer-space-pick-${layer.id}'),
+                          behavior: HitTestBehavior.opaque,
+                          onPointerDown:
+                              (event) =>
+                                  _markSpacesAt(layer, event.localPosition),
+                        ),
+                      ),
+                  ],
                 ),
               ),
             ],
@@ -654,7 +788,6 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
                 itemBuilder: (context, displayIndex) {
                   final index = _layers.length - 1 - displayIndex;
                   final layer = _layers[index];
-                  final preview = layer.controller.text.replaceAll('\n', ' ');
                   return Container(
                     key: ValueKey('composer-layer-row-${layer.id}'),
                     padding: const EdgeInsets.fromLTRB(7, 4, 3, 4),
@@ -667,7 +800,7 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
                       children: [
                         Expanded(
                           child: Text(
-                            preview.isEmpty ? '文字 ${index + 1}' : preview,
+                            layer.label,
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
                             style: const TextStyle(
@@ -707,6 +840,79 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
                 },
               ),
             ),
+            const Divider(height: 1, color: Colors.black),
+            Padding(
+              padding: const EdgeInsets.all(6),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: _SpaceSelectButton(
+                      key: const Key('composer-space-single'),
+                      label: '选择空格忽略',
+                      active: _spaceSelection == _SpaceSelection.single,
+                      onPressed:
+                          () => _toggleSpaceSelection(_SpaceSelection.single),
+                    ),
+                  ),
+                  const SizedBox(width: 5),
+                  Expanded(
+                    child: _SpaceSelectButton(
+                      key: const Key('composer-space-cross'),
+                      label: '跨行选择空格',
+                      active: _spaceSelection == _SpaceSelection.crossLine,
+                      onPressed:
+                          () =>
+                              _toggleSpaceSelection(_SpaceSelection.crossLine),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(6, 0, 6, 6),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: _SpaceSelectButton(
+                      key: const Key('composer-space-erase'),
+                      label: '手动取消选择',
+                      active: _spaceSelection == _SpaceSelection.erase,
+                      onPressed:
+                          () => _toggleSpaceSelection(_SpaceSelection.erase),
+                    ),
+                  ),
+                  const SizedBox(width: 5),
+                  _MarkHistoryButton(
+                    key: const Key('composer-marks-undo'),
+                    icon: Icons.undo,
+                    tooltip: '撤销空格标记',
+                    onPressed: _canUndoMarks ? _undoMarks : null,
+                  ),
+                  const SizedBox(width: 5),
+                  _MarkHistoryButton(
+                    key: const Key('composer-marks-redo'),
+                    icon: Icons.redo,
+                    tooltip: '重做空格标记',
+                    onPressed: _canRedoMarks ? _redoMarks : null,
+                  ),
+                ],
+              ),
+            ),
+            if (_spaceSelection != _SpaceSelection.off)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(7, 0, 7, 6),
+                child: Text(
+                  _spaceSelection == _SpaceSelection.erase
+                      ? '在窗口里选中文字，选区内的标记会被取消'
+                      : '点窗口里的空格标记为透明，再点按钮结束',
+                  style: const TextStyle(
+                    fontFamily: 'Saitamaar',
+                    fontSize: 12,
+                    height: 1.2,
+                    color: Color(0xff006600),
+                  ),
+                ),
+              ),
           ],
         ),
       ),
@@ -779,11 +985,16 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
     return Size(width, height);
   }
 
-  void _addTextLayer({String initialText = '', bool requestFocus = true}) {
+  void _addTextLayer({
+    String initialText = '',
+    bool requestFocus = true,
+    bool fromAa = false,
+  }) {
     final id = _nextLayerId++;
     final stagger = _layers.length % 5;
     final layer = _EditorLayer(
       id: id,
+      label: fromAa ? 'AA窗口 ${_nextAaNumber++}' : '文字窗口 ${_nextTextNumber++}',
       position: Offset(
         _canvasXForColumn(1 + stagger * 4),
         _canvasYForRow(1 + stagger),
@@ -799,7 +1010,150 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
     }
   }
 
+  /// Turns a tap inside a window into a marked run of whitespace. The pointer
+  /// is resolved to a line and a pixel offset, because in a proportional face
+  /// a character index says nothing about where a column sits.
+  void _markSpacesAt(_EditorLayer layer, Offset local) {
+    final lines = layer.controller.text.replaceAll('\r', '').split('\n');
+    final line = ((local.dy - _editorTextTop) / _rowHeight).floor();
+    final x = local.dx - _editorTextLeft;
+    if (line < 0 || line >= lines.length || x < 0) return;
+
+    final found = connectedSpaceRuns(
+      lines,
+      line,
+      x,
+      _measureRun,
+      crossLines: _spaceSelection == _SpaceSelection.crossLine,
+    );
+    if (found.isEmpty) return;
+
+    // Tapping a run that is already marked takes the mark off again.
+    final spans = List<ComposerSpan>.from(layer.transparentSpans);
+    final removing = found.every(spans.contains);
+    for (final span in found) {
+      spans.remove(span);
+      if (!removing) spans.add(span);
+    }
+    setState(() {
+      layer.transparentSpans = spans;
+      layer.markedText = layer.controller.text;
+    });
+    _recordMarks();
+  }
+
+  /// The window's text split into lines, the same way the composer does it.
+  List<String> _layerLines(_EditorLayer layer) =>
+      const LineSplitter().convert(layer.controller.text);
+
+  bool get _canUndoMarks => _markHistoryIndex > 0;
+  bool get _canRedoMarks => _markHistoryIndex < _markHistory.length - 1;
+
+  void _recordMarks() {
+    final snapshot = {
+      for (final layer in _layers)
+        layer.id: List<ComposerSpan>.from(layer.transparentSpans),
+    };
+    if (_markHistoryIndex < _markHistory.length - 1) {
+      _markHistory.removeRange(_markHistoryIndex + 1, _markHistory.length);
+    }
+    _markHistory.add(snapshot);
+    _markHistoryIndex = _markHistory.length - 1;
+  }
+
+  void _applyMarkSnapshot(Map<int, List<ComposerSpan>> snapshot) {
+    setState(() {
+      for (final layer in _layers) {
+        layer.transparentSpans = snapshot[layer.id] ?? const [];
+        layer.markedText = layer.controller.text;
+      }
+    });
+  }
+
+  void _undoMarks() {
+    if (!_canUndoMarks) return;
+    _markHistoryIndex--;
+    _applyMarkSnapshot(_markHistory[_markHistoryIndex]);
+  }
+
+  void _redoMarks() {
+    if (!_canRedoMarks) return;
+    _markHistoryIndex++;
+    _applyMarkSnapshot(_markHistory[_markHistoryIndex]);
+  }
+
+  /// Editing a window invalidates every rune index, so the marks and the trail
+  /// of steps that produced them both go.
+  void _forgetMarkHistory() {
+    _markHistory
+      ..clear()
+      ..add({});
+    _markHistoryIndex = 0;
+  }
+
+  /// Position of a UTF-16 [offset] inside [text], as a line and a rune index.
+  (int, int) _positionAt(String text, int offset) {
+    var line = 0;
+    var index = 0;
+    var seen = 0;
+    for (final rune in text.runes) {
+      if (seen >= offset) break;
+      seen += rune > 0xffff ? 2 : 1;
+      if (rune == 0x0a) {
+        line++;
+        index = 0;
+      } else {
+        index++;
+      }
+    }
+    return (line, index);
+  }
+
+  /// Drops every mark the window's own text selection touches. The native
+  /// selection is the picker here, so one space or a whole sweep both work.
+  void _eraseSelectedMarks(_EditorLayer layer) {
+    final selection = layer.controller.selection;
+    if (!selection.isValid || selection.isCollapsed) return;
+    if (layer.transparentSpans.isEmpty) return;
+
+    final text = layer.controller.text;
+    final (startLine, startIndex) = _positionAt(text, selection.start);
+    final (endLine, endIndex) = _positionAt(text, selection.end);
+
+    bool touched(ComposerSpan span) {
+      if (span.line < startLine || span.line > endLine) return false;
+      final from = span.line == startLine ? startIndex : 0;
+      final to = span.line == endLine ? endIndex : span.end;
+      return span.start < to && span.end > from;
+    }
+
+    final kept =
+        layer.transparentSpans.where((span) => !touched(span)).toList();
+    if (kept.length == layer.transparentSpans.length) return;
+    setState(() => layer.transparentSpans = kept);
+    _recordMarks();
+  }
+
+  void _toggleSpaceSelection(_SpaceSelection mode) {
+    setState(() {
+      _spaceSelection = _spaceSelection == mode ? _SpaceSelection.off : mode;
+    });
+  }
+
   void _onLayerTextChanged() {
+    var invalidated = false;
+    for (final layer in _layers) {
+      if (layer.transparentSpans.isEmpty) continue;
+      if (layer.markedText != layer.controller.text) {
+        layer.transparentSpans = const [];
+        invalidated = true;
+      } else if (_spaceSelection == _SpaceSelection.erase) {
+        // A TextEditingController reports selection changes here too, which
+        // is exactly the signal the erase mode runs on.
+        _eraseSelectedMarks(layer);
+      }
+    }
+    if (invalidated) _forgetMarkHistory();
     if (mounted) setState(() {});
   }
 
@@ -809,7 +1163,7 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
       MaterialPageRoute(builder: (context) => const AaPickerPage()),
     );
     if (!mounted || text == null || text.trim().isEmpty) return;
-    _addTextLayer(initialText: text, requestFocus: false);
+    _addTextLayer(initialText: text, requestFocus: false, fromAa: true);
   }
 
   void _removeLayer(_EditorLayer layer) {
@@ -910,6 +1264,7 @@ class _PostComposerSheetState extends State<PostComposerSheet> {
         text: layer.controller.text,
         row: _rowForCanvasY(layer.position.dy),
         column: _columnForCanvasX(layer.position.dx),
+        transparentSpans: layer.transparentSpans,
       );
     });
     final result = composeTextLayers(
@@ -1076,15 +1431,80 @@ class _OutOfFramePainter extends CustomPainter {
       oldDelegate.originX != originX || oldDelegate.originY != originY;
 }
 
+/// Paints the marked whitespace runs behind a window's text.
+class _SpaceMarkPainter extends CustomPainter {
+  const _SpaceMarkPainter({
+    required this.spans,
+    required this.lines,
+    required this.measure,
+    required this.rowHeight,
+    required this.textLeft,
+    required this.textTop,
+  });
+
+  final List<ComposerSpan> spans;
+  final List<String> lines;
+  final ComposerGlyphWidth measure;
+  final double rowHeight;
+  final double textLeft;
+  final double textTop;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (spans.isEmpty) return;
+    final paint = Paint()..color = const Color(0x5c00c853);
+    for (final span in spans) {
+      if (span.line < 0 || span.line >= lines.length) continue;
+      final runes = lines[span.line].runes.toList(growable: false);
+      if (span.start >= runes.length) continue;
+      final end = math.min(span.end, runes.length);
+      final left = measure(String.fromCharCodes(runes.take(span.start)));
+      final width = measure(
+        String.fromCharCodes(runes.getRange(span.start, end)),
+      );
+      canvas.drawRect(
+        Rect.fromLTWH(
+          textLeft + left,
+          textTop + span.line * rowHeight,
+          width,
+          rowHeight,
+        ),
+        paint,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _SpaceMarkPainter oldDelegate) =>
+      !listEquals(oldDelegate.spans, spans) ||
+      !listEquals(oldDelegate.lines, lines) ||
+      oldDelegate.rowHeight != rowHeight;
+}
+
 class _EditorLayer {
-  _EditorLayer({required this.id, required this.position, String text = ''})
-    : controller = TextEditingController(text: text);
+  _EditorLayer({
+    required this.id,
+    required this.label,
+    required this.position,
+    String text = '',
+  }) : controller = TextEditingController(text: text);
 
   final int id;
+
+  /// What the window is called in the layer panel and its own title bar. A
+  /// drawing's own characters make an unreadable label, and the position in
+  /// the list would change every time the layers are reordered.
+  final String label;
   final TextEditingController controller;
   final FocusNode focusNode = FocusNode();
   Offset position;
   Offset? dragPosition;
+
+  /// Whitespace runs the author marked as see-through, along with the text
+  /// they were measured against. Editing the text drops them, because a rune
+  /// index no longer points at the same character.
+  List<ComposerSpan> transparentSpans = const [];
+  String markedText = '';
 
   void dispose() {
     controller.dispose();
@@ -1100,6 +1520,82 @@ class _PlacedGlyph {
   final double advance;
 
   double get end => x + advance;
+}
+
+/// A compact square button for stepping the marking history.
+class _MarkHistoryButton extends StatelessWidget {
+  const _MarkHistoryButton({
+    required this.icon,
+    required this.tooltip,
+    required this.onPressed,
+    super.key,
+  });
+
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback? onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return Tooltip(
+      message: tooltip,
+      child: OutlinedButton(
+        onPressed: onPressed,
+        style: OutlinedButton.styleFrom(
+          foregroundColor: Colors.black,
+          backgroundColor: const Color(0xffefefef),
+          disabledForegroundColor: const Color(0xffaaaaaa),
+          minimumSize: const Size(34, 30),
+          fixedSize: const Size(34, 30),
+          padding: EdgeInsets.zero,
+          side: BorderSide(
+            color: onPressed == null ? const Color(0xffaaaaaa) : Colors.black,
+          ),
+          shape: const RoundedRectangleBorder(),
+        ),
+        child: Icon(icon, size: 17),
+      ),
+    );
+  }
+}
+
+/// A latching button: it stays lit while its selection mode is on.
+class _SpaceSelectButton extends StatelessWidget {
+  const _SpaceSelectButton({
+    required this.label,
+    required this.active,
+    required this.onPressed,
+    super.key,
+  });
+
+  final String label;
+  final bool active;
+  final VoidCallback onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return OutlinedButton(
+      onPressed: onPressed,
+      style: OutlinedButton.styleFrom(
+        foregroundColor: active ? const Color(0xff006600) : Colors.black,
+        backgroundColor:
+            active ? const Color(0x3300c853) : const Color(0xffefefef),
+        minimumSize: const Size(0, 30),
+        padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 5),
+        side: BorderSide(
+          color: active ? const Color(0xff006600) : Colors.black,
+          width: active ? 1.5 : 1,
+        ),
+        shape: const RoundedRectangleBorder(),
+        textStyle: const TextStyle(
+          fontFamily: 'Saitamaar',
+          fontSize: 12,
+          height: 1,
+        ),
+      ),
+      child: FittedBox(fit: BoxFit.scaleDown, child: Text(label)),
+    );
+  }
 }
 
 class _ComposerButton extends StatelessWidget {

@@ -1036,11 +1036,12 @@ class _PullToRefreshState extends State<_PullToRefresh> {
   static const _triggerDistance = 64.0;
 
   double _pullDistance = 0;
-  double _maxPullDistance = 0;
   _PullEdge _edge = _PullEdge.bottom;
   bool _refreshing = false;
 
-  bool get _armed => _maxPullDistance >= _triggerDistance;
+  /// Read from how far the list is pulled *right now*, so easing back past the
+  /// threshold before letting go calls the refresh off.
+  bool get _armed => _pullDistance >= _triggerDistance;
 
   String get _label {
     if (_refreshing) return '正在刷新';
@@ -1050,10 +1051,15 @@ class _PullToRefreshState extends State<_PullToRefresh> {
   @override
   Widget build(BuildContext context) {
     final showing = _refreshing || _pullDistance > 0;
-    return NotificationListener<ScrollNotification>(
-      key: const Key('pull-refresh'),
-      onNotification: _handleScroll,
-      child: Stack(
+    return Listener(
+      // The refresh starts the moment the finger leaves the glass. Waiting for
+      // the scroll to report it ended means waiting out the rebound spring.
+      onPointerUp: (_) => _handleRelease(),
+      onPointerCancel: (_) => _handleRelease(),
+      child: NotificationListener<ScrollNotification>(
+        key: const Key('pull-refresh'),
+        onNotification: _handleScroll,
+        child: Stack(
         children: [
           Positioned.fill(child: widget.child),
           if (showing)
@@ -1086,7 +1092,8 @@ class _PullToRefreshState extends State<_PullToRefresh> {
                 ),
               ),
             ),
-        ],
+          ],
+        ),
       ),
     );
   }
@@ -1099,46 +1106,45 @@ class _PullToRefreshState extends State<_PullToRefresh> {
     // ignored until it finishes.
     if (!widget.enabled || _refreshing) return false;
 
+    // Read the pull straight off the metrics rather than accumulating the
+    // deltas: an accumulator only ever grew, because the notifications for
+    // easing back the other way were filtered out as the wrong direction.
     final metrics = notification.metrics;
-    if (notification is OverscrollNotification) {
-      if (notification.overscroll > 0 && metrics.extentAfter <= 0.01) {
-        _setPull(_PullEdge.bottom, _pullDistance + notification.overscroll);
-      } else if (notification.overscroll < 0 && metrics.extentBefore <= 0.01) {
-        _setPull(_PullEdge.top, _pullDistance - notification.overscroll);
-      }
-    } else if (notification is ScrollUpdateNotification) {
-      final beyondBottom = metrics.pixels - metrics.maxScrollExtent;
-      final beyondTop = metrics.minScrollExtent - metrics.pixels;
-      if (beyondBottom > 0 && metrics.extentAfter <= 0.01) {
-        _setPull(_PullEdge.bottom, beyondBottom);
-      } else if (beyondTop > 0 && metrics.extentBefore <= 0.01) {
-        _setPull(_PullEdge.top, beyondTop);
-      }
-    } else if (notification is ScrollEndNotification && _maxPullDistance > 0) {
-      if (_armed) {
-        unawaited(_refresh());
-      } else {
-        _resetPull();
-      }
+    final beyondBottom = metrics.pixels - metrics.maxScrollExtent;
+    final beyondTop = metrics.minScrollExtent - metrics.pixels;
+    if (beyondBottom > 0) {
+      _setPull(_PullEdge.bottom, beyondBottom);
+    } else if (beyondTop > 0) {
+      _setPull(_PullEdge.top, beyondTop);
+    } else {
+      _resetPull();
     }
     return false;
   }
 
+  /// Decides the pull the instant the finger lifts, on the distance showing at
+  /// that moment.
+  void _handleRelease() {
+    if (!widget.enabled || _refreshing) return;
+    if (_armed) {
+      unawaited(_refresh());
+    } else {
+      _resetPull();
+    }
+  }
+
   void _setPull(_PullEdge edge, double value) {
     final next = value.clamp(0, _triggerDistance * 1.5).toDouble();
+    if (_edge == edge && (next - _pullDistance).abs() < 0.01) return;
     setState(() {
       _edge = edge;
       _pullDistance = next;
-      if (next > _maxPullDistance) _maxPullDistance = next;
     });
   }
 
   void _resetPull() {
-    if ((_pullDistance == 0 && _maxPullDistance == 0) || !mounted) return;
-    setState(() {
-      _pullDistance = 0;
-      _maxPullDistance = 0;
-    });
+    if (_pullDistance == 0 || !mounted) return;
+    setState(() => _pullDistance = 0);
   }
 
   Future<void> _refresh() async {
@@ -1148,7 +1154,6 @@ class _PullToRefreshState extends State<_PullToRefresh> {
     setState(() {
       _refreshing = true;
       _pullDistance = 0;
-      _maxPullDistance = 0;
     });
     try {
       await widget.onRefresh();
